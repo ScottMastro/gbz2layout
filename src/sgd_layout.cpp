@@ -137,6 +137,8 @@ void path_linear_sgd_layout(const gbwtgraph::GBWTGraph& graph,
         const sdsl::bit_vector&   np_bv  = path_index.get_np_bv();
         const sdsl::int_vector<>& nr_iv  = path_index.get_nr_iv();
         const sdsl::int_vector<>& npi_iv = path_index.get_npi_iv();
+        const std::vector<std::int32_t>* region = p.region;   // hierarchical: interior region id (-1 = anchor)
+        const std::vector<bool>*         freeze = p.freeze;   // hierarchical: frozen anchor nodes
         std::uniform_int_distribution<std::uint64_t> dis_step(0, np_bv.size() - 1);
         std::uniform_int_distribution<std::uint64_t> flip(0, 1);
         std::uint64_t local = 0;
@@ -210,6 +212,19 @@ void path_linear_sgd_layout(const gbwtgraph::GBWTGraph& graph,
 
             std::uint64_t i = path_index.rank_of_handle(term_i);   // <-- id->rank remap
             std::uint64_t j = path_index.rank_of_handle(term_j);
+
+            // hierarchical cut: drop pairs that link two different bubble
+            // interiors (neither is an anchor). Anchors (region -1) belong to
+            // every region, so anchor<->interior pairs always pass and pin the
+            // bubble to the backbone. Count the sample so iterations advance.
+            if (region) {
+                std::int32_t ri = (*region)[i], rj = (*region)[j];
+                if (ri != -1 && rj != -1 && ri != rj) {
+                    if (++local >= 1000) { term_updates += local; updates_done += local; local = 0; }
+                    continue;
+                }
+            }
+
             std::uint64_t offset_i = use_other_end_a ? 1 : 0;
             std::uint64_t offset_j = use_other_end_b ? 1 : 0;
 
@@ -227,10 +242,15 @@ void path_linear_sgd_layout(const gbwtgraph::GBWTGraph& graph,
             // all nodes move freely; reference (pin_y) nodes are pulled back
             // toward Y=0 once per iteration in the checker thread (see below),
             // so the pull strength is independent of sampling frequency.
-            X[2 * i + offset_i].store(X[2 * i + offset_i].load() - r_x);
-            Y[2 * i + offset_i].store(Y[2 * i + offset_i].load() - r_y);
-            X[2 * j + offset_j].store(X[2 * j + offset_j].load() + r_x);
-            Y[2 * j + offset_j].store(Y[2 * j + offset_j].load() + r_y);
+            // frozen anchors (reference backbone in hierarchical mode) never move
+            if (!(freeze && (*freeze)[i])) {
+                X[2 * i + offset_i].store(X[2 * i + offset_i].load() - r_x);
+                Y[2 * i + offset_i].store(Y[2 * i + offset_i].load() - r_y);
+            }
+            if (!(freeze && (*freeze)[j])) {
+                X[2 * j + offset_j].store(X[2 * j + offset_j].load() + r_x);
+                Y[2 * j + offset_j].store(Y[2 * j + offset_j].load() + r_y);
+            }
 
             if (++local >= 1000) { term_updates += local; updates_done += local; local = 0; }
         }

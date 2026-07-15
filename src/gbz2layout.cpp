@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <thread>
 #include <iostream>
 #include <queue>
@@ -36,6 +37,7 @@ static void usage() {
     "  --iter N           max SGD iterations [30]\n"
     "  --updates-per-node M   min_term_updates = M * node_count (else 10*steps)\n"
     "  --init ref|random  initialization [ref]\n"
+    "  --hierarchical     freeze backbone, lay out each bubble independently (prototype)\n"
     "  --seed N           RNG seed [9399220]\n";
 }
 
@@ -53,6 +55,7 @@ int main(int argc, char** argv) {
     bool pin_reference = false;
     double pin_strength = 1.0; // 1 = hard pin, 0 = free, between = soft spring
     bool emit_links = false;   // also write PREFIX.links.tsv (edges) for rendering
+    bool hierarchical = false; // divide-and-conquer: freeze backbone, lay out each bubble independently
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -68,6 +71,7 @@ int main(int argc, char** argv) {
         else if (a == "--pin-reference") pin_reference = true;
         else if (a == "--pin-strength") { pin_reference = true; pin_strength = std::stod(next()); }
         else if (a == "--emit-links") emit_links = true;
+        else if (a == "--hierarchical") hierarchical = true;
         else { std::cerr << "unknown arg: " << a << "\n"; usage(); return 1; }
     }
     if (out_prefix.empty()) { std::cerr << "error: -o required\n"; return 1; }
@@ -209,10 +213,62 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- hierarchical (divide-and-conquer): freeze the reference backbone flat
+    // on Y=0 and partition off-reference nodes into independent bubble regions
+    // (connected components of the non-reference subgraph). Each bubble then
+    // settles on its own against the fixed backbone; cross-bubble forces are cut.
+    std::vector<bool>         freeze_mask;   // reference/anchor nodes (never move)
+    std::vector<std::int32_t> region;        // interior region id; -1 = anchor
+    if (hierarchical) {
+        if (!xp.has_reference()) {
+            std::cerr << "[gbz2layout] --hierarchical: no reference path; ignoring\n";
+            hierarchical = false;
+        } else {
+            freeze_mask.assign(N, false);
+            for (std::uint32_t r : xp.ref_ranks()) {
+                freeze_mask[r] = true;
+                Y[2 * r].store(0.0);        // flat skeleton on Y=0 (X already = bp)
+                Y[2 * r + 1].store(0.0);
+            }
+            // union-find over non-reference nodes: connect interior neighbours.
+            std::vector<std::uint64_t> uf(N);
+            for (std::uint64_t r = 0; r < N; ++r) uf[r] = r;
+            std::function<std::uint64_t(std::uint64_t)> find =
+                [&](std::uint64_t x){ while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; } return x; };
+            auto uni = [&](std::uint64_t a, std::uint64_t b){ uf[find(a)] = find(b); };
+            for (std::uint64_t r = 0; r < N; ++r) {
+                if (freeze_mask[r]) continue;
+                handle_t h = graph.get_handle(xp.node_id_of_rank(r), false);
+                for (bool go_left : {false, true})
+                    graph.follow_edges(h, go_left, [&](const handle_t& nb) {
+                        std::uint64_t nr = xp.rank_of_handle(nb);
+                        if (nr < N && !freeze_mask[nr]) uni(r, nr);
+                        return true;
+                    });
+            }
+            // densify component roots into region ids; anchors get -1
+            region.assign(N, -1);
+            std::vector<std::int32_t> root2id(N, -1);
+            std::int32_t next_id = 0;
+            std::uint64_t interior = 0;
+            for (std::uint64_t r = 0; r < N; ++r) {
+                if (freeze_mask[r]) continue;
+                std::uint64_t root = find(r);
+                if (root2id[root] < 0) root2id[root] = next_id++;
+                region[r] = root2id[root];
+                ++interior;
+            }
+            std::cerr << "[gbz2layout] hierarchical: " << (N - interior) << " frozen anchors, "
+                      << interior << " interior nodes in " << next_id << " bubble regions\n";
+        }
+    }
+
     // ---- SGD params (odgi defaults) ----
     SgdParams p;
     p.pin_y = ref_mask.empty() ? nullptr : &ref_mask;
     p.pin_strength = pin_strength;
+    p.region = hierarchical ? &region : nullptr;
+    p.freeze = hierarchical ? &freeze_mask : nullptr;
     p.iter_max = iter_max;
     p.nthreads = threads;
     p.seed = seed;

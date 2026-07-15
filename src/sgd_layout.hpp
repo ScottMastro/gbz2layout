@@ -41,6 +41,15 @@ struct SgdParams {
     // but bubbles can still bend it). Used to keep the backbone ~linear.
     const std::vector<bool>* pin_y = nullptr;
     double pin_strength = 1.0;
+
+    // ---- hierarchical (divide-and-conquer) mode ----
+    // region[rank] = interior region id, or -1 for a reference/anchor node that
+    // belongs to every region. A term update is applied only if the two nodes
+    // share a region OR one is an anchor (region -1); cross-region interior
+    // pairs are dropped, so each bubble settles independently against the fixed
+    // backbone. freeze[rank]==true nodes never move (the anchors).
+    const std::vector<std::int32_t>* region = nullptr;
+    const std::vector<bool>*         freeze = nullptr;
 };
 
 // X, Y are each sized 2 * node_count (two endpoints per node), indexed by
