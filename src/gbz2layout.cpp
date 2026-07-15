@@ -58,6 +58,7 @@ int main(int argc, char** argv) {
     bool pin_reference = false;
     double pin_strength = 1.0; // 1 = hard pin, 0 = free, between = soft spring
     bool emit_links = false;   // also write PREFIX.links.tsv (edges) for rendering
+    bool emit_meta = false;    // also write PREFIX.meta.tsv (rank, is_ref) for analysis
     bool hierarchical = false; // divide-and-conquer: freeze backbone, lay out each bubble independently
     std::uint64_t compartments = 0;   // >0: balanced pinch-bounded compartments (target task count)
     std::uint64_t pinch_window = 50;  // local-envelope half-window (reference nodes)
@@ -76,6 +77,7 @@ int main(int argc, char** argv) {
         else if (a == "--pin-reference") pin_reference = true;
         else if (a == "--pin-strength") { pin_reference = true; pin_strength = std::stod(next()); }
         else if (a == "--emit-links") emit_links = true;
+        else if (a == "--emit-meta") emit_meta = true;
         else if (a == "--hierarchical") hierarchical = true;
         else if (a == "--compartments") compartments = std::stoull(next());
         else if (a == "--pinch-window") pinch_window = std::stoull(next());
@@ -358,6 +360,25 @@ int main(int argc, char** argv) {
         }
         lo.close();
         std::cerr << "[gbz2layout] wrote " << lp << " (" << nlinks << " links)\n";
+    }
+
+    // ---- optional: emit per-node meta (rank, is_ref) for external analysis ----
+    if (emit_meta) {
+        std::vector<char> is_ref(N, 0);
+        if (xp.has_reference()) for (std::uint32_t r : xp.ref_ranks()) is_ref[r] = 1;
+        bool have_seg = graph.has_segment_names();
+        std::string mp = out_prefix + ".meta.tsv";
+        std::ofstream mo(mp);
+        mo << "rank\tis_ref\tsegment\n";      // segment = original GFA segment name (pre-chop)
+        for (std::uint64_t r = 0; r < N; ++r) {
+            mo << r << '\t' << (int)is_ref[r] << '\t';
+            if (have_seg) mo << graph.get_segment_name(graph.get_handle(xp.node_id_of_rank(r), false));
+            else          mo << r;
+            mo << '\n';
+        }
+        mo.close();
+        std::uint64_t nref = 0; for (char c : is_ref) nref += c;
+        std::cerr << "[gbz2layout] wrote " << mp << " (" << nref << " reference nodes)\n";
     }
     return 0;
 }
