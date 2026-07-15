@@ -36,6 +36,12 @@ $(BUILD)/eval_crossings: $(SRC)/eval_crossings.cpp | $(BUILD)
 
 crossings: $(BUILD)/eval_crossings
 
+# block-cut (compartment) structure probe
+$(BUILD)/compartments: $(SRC)/compartments.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(SRC)/compartments.cpp $(SRC)/xp.cpp $(LDFLAGS) $(LIBS) -o $@
+
+compartments: $(BUILD)/compartments
+
 # original probe (kept)
 $(BUILD)/xp_probe: $(SRC)/xp_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(SRC)/xp_probe.cpp $(LDFLAGS) $(LIBS) -o $@
@@ -49,3 +55,9 @@ $(BUILD):
 
 clean:
 	rm -f $(BUILD)/gbz2layout $(BUILD)/test_xp $(BUILD)/xp_probe
+
+# path-pinch (all-haplotype convergence) probe
+$(BUILD)/pinch: $(SRC)/pinch.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(SRC)/pinch.cpp $(LDFLAGS) $(LIBS) -o $@
+
+pinch: $(BUILD)/pinch
