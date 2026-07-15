@@ -20,6 +20,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <deque>
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::cerr << "usage: pinch <graph.gbz> [frac=1.0]\n"; return 1; }
@@ -63,6 +64,8 @@ int main(int argc, char** argv) {
     std::vector<std::uint64_t> gap_nodes;    // ref-node count between consecutive pinches
     std::uint64_t nodes_since = 0;
     std::uint64_t bp = 0;
+    std::vector<std::int32_t> ref_cov;       // coverage of every reference node (diagnostic)
+    std::vector<std::uint64_t> ref_bp;       // cumulative bp position at each reference node
     graph.for_each_path_handle([&](const handlegraph::path_handle_t& p) {
         if (found) return;   // first (reference) path only
         found = true;
@@ -72,6 +75,8 @@ int main(int argc, char** argv) {
             std::uint64_t len = graph.get_length(h);
             ref_nodes++;
             nodes_since++;
+            ref_cov.push_back(cov[id - minid]);
+            ref_bp.push_back(bp);
             if (cov[id - minid] >= thresh) {
                 pinches++;
                 if (have_last) { gaps.push_back(bp - last_pinch_bp); gap_nodes.push_back(nodes_since); }
@@ -96,6 +101,67 @@ int main(int argc, char** argv) {
         std::cout << "    <=100:" << h1 << "  101-1k:" << h2 << "  1k-10k:" << h3
                   << "  10k-100k:" << h4 << "  >100k:" << h5 << "\n";
     };
+
+    // DIAGNOSTIC: distribution of coverage over reference nodes. If the genome
+    // is "mostly constant", most backbone nodes should sit near the peak H.
+    {
+        std::vector<std::int32_t> c = ref_cov;
+        std::sort(c.begin(), c.end());
+        auto q = [&](double p){ return c.empty()?0:c[std::min(c.size()-1,(std::size_t)(p*c.size()))]; };
+        std::cout << "=== reference-node coverage distribution (H=" << H << ", " << n_paths << " paths) ===\n";
+        std::cout << "min " << (c.empty()?0:c.front()) << "  p10 " << q(0.1) << "  p25 " << q(0.25)
+                  << "  median " << q(0.5) << "  p75 " << q(0.75) << "  p90 " << q(0.9)
+                  << "  max " << (c.empty()?0:c.back()) << "\n";
+        for (double f : {0.50, 0.80, 0.90, 0.95, 0.99, 1.00}) {
+            std::int32_t t = (std::int32_t)std::ceil(f * H);
+            std::uint64_t n = 0; for (auto v : ref_cov) if (v >= t) n++;
+            std::cout << "  cov>=" << (int)(f*100) << "%H (>=" << t << "):  " << n
+                      << "  (" << (ref_nodes?100.0*n/ref_nodes:0) << "% of ref nodes)\n";
+        }
+    }
+
+    // LOCAL-ENVELOPE pinch: a reference node is a pinch if it is covered by as
+    // many haplotypes as any node within a local window, i.e. all haplotypes
+    // *present here* are on it (absent/gapped haplotypes don't block the cut).
+    // This is the layout-relevant criterion; global-H convergence over-counts
+    // systematically-missing haplotypes as if they diverted.
+    auto local_pinch = [&](std::uint64_t W, double slack){
+        std::uint64_t n = ref_cov.size();
+        std::vector<std::int32_t> rollmax(n, 0);
+        std::deque<std::uint64_t> dq;   // indices, decreasing cov
+        // sliding window max over [i-W, i+W]
+        std::uint64_t r = 0;
+        for (std::uint64_t i = 0; i < n; ++i) {
+            std::uint64_t hi = std::min(n, i + W + 1);
+            while (r < hi) {
+                while (!dq.empty() && ref_cov[dq.back()] <= ref_cov[r]) dq.pop_back();
+                dq.push_back(r); ++r;
+            }
+            std::uint64_t lo = (i > W) ? i - W : 0;
+            while (!dq.empty() && dq.front() < lo) dq.pop_front();
+            rollmax[i] = ref_cov[dq.front()];
+        }
+        std::uint64_t np = 0; bool have = false; std::uint64_t last = 0;
+        std::vector<std::uint64_t> g;
+        for (std::uint64_t i = 0; i < n; ++i) {
+            if (ref_cov[i] >= (std::int32_t)std::ceil(slack * rollmax[i]) && rollmax[i] > 0) {
+                np++;
+                if (have) g.push_back(ref_bp[i] - last);
+                last = ref_bp[i]; have = true;
+            }
+        }
+        std::sort(g.begin(), g.end());
+        auto q = [&](double p){ return g.empty()?0:g[std::min(g.size()-1,(std::size_t)(p*g.size()))]; };
+        std::uint64_t h1=0,h2=0,h3=0,h4=0,h5=0; for (auto x:g){ if(x<=100)h1++; else if(x<=1000)h2++; else if(x<=10000)h3++; else if(x<=100000)h4++; else h5++; }
+        std::cout << "  window +/-" << W << " nodes, slack " << slack << ":  pinches " << np
+                  << " (" << (ref_nodes?100.0*np/ref_nodes:0) << "% of ref nodes)\n";
+        std::cout << "    gap bp:  median " << q(0.5) << "  p90 " << q(0.9) << "  p99 " << q(0.99) << "  max " << (g.empty()?0:g.back()) << "\n";
+        std::cout << "    gaps by bp:  <=100:" << h1 << "  101-1k:" << h2 << "  1k-10k:" << h3 << "  10k-100k:" << h4 << "  >100k:" << h5 << "\n";
+    };
+    std::cout << "=== LOCAL-envelope pinch (all *present* haplotypes converge) ===\n";
+    local_pinch(50, 1.0);
+    local_pinch(50, 0.98);
+    local_pinch(200, 1.0);
 
     double refbp = (double)bp;
     std::cout << "=== path-pinch (all-haplotype convergence) structure ===\n";
