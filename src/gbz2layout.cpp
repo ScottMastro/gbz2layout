@@ -9,6 +9,7 @@
 
 #include "xp.hpp"
 #include "sgd_layout.hpp"
+#include "compartment.hpp"
 
 #include <gbwtgraph/gbz.h>
 
@@ -38,6 +39,8 @@ static void usage() {
     "  --updates-per-node M   min_term_updates = M * node_count (else 10*steps)\n"
     "  --init ref|random  initialization [ref]\n"
     "  --hierarchical     freeze backbone, lay out each bubble independently (prototype)\n"
+    "  --compartments N   balanced pinch-bounded compartments, N target tasks (parallel-ready)\n"
+    "  --pinch-window W   local-envelope half-window for pinch detection [50]\n"
     "  --seed N           RNG seed [9399220]\n";
 }
 
@@ -56,6 +59,8 @@ int main(int argc, char** argv) {
     double pin_strength = 1.0; // 1 = hard pin, 0 = free, between = soft spring
     bool emit_links = false;   // also write PREFIX.links.tsv (edges) for rendering
     bool hierarchical = false; // divide-and-conquer: freeze backbone, lay out each bubble independently
+    std::uint64_t compartments = 0;   // >0: balanced pinch-bounded compartments (target task count)
+    std::uint64_t pinch_window = 50;  // local-envelope half-window (reference nodes)
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -72,6 +77,8 @@ int main(int argc, char** argv) {
         else if (a == "--pin-strength") { pin_reference = true; pin_strength = std::stod(next()); }
         else if (a == "--emit-links") emit_links = true;
         else if (a == "--hierarchical") hierarchical = true;
+        else if (a == "--compartments") compartments = std::stoull(next());
+        else if (a == "--pinch-window") pinch_window = std::stoull(next());
         else { std::cerr << "unknown arg: " << a << "\n"; usage(); return 1; }
     }
     if (out_prefix.empty()) { std::cerr << "error: -o required\n"; return 1; }
@@ -213,6 +220,26 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- compartment mode: balanced pinch-bounded chunks laid out jointly ----
+    // Each compartment = a backbone stretch + its bubbles (full SGD inside, so
+    // it de-collides); only the chosen boundary pinches are frozen anchors.
+    std::vector<bool>         comp_freeze;
+    std::vector<std::int32_t> comp_region;
+    if (compartments > 0) {
+        if (!xp.has_reference()) {
+            std::cerr << "[gbz2layout] --compartments: no reference path; ignoring\n";
+            compartments = 0;
+        } else {
+            CompartmentResult cr = build_compartments(
+                gbz, graph, xp, compartments, pinch_window, genome_min_id,
+                chromosome.empty() ? nullptr : &mask, true);
+            comp_region = std::move(cr.region);
+            comp_freeze = std::move(cr.freeze);
+            for (std::uint64_t r = 0; r < N; ++r)
+                if (comp_freeze[r]) { Y[2 * r].store(0.0); Y[2 * r + 1].store(0.0); }  // anchors on Y=0
+        }
+    }
+
     // ---- hierarchical (divide-and-conquer): freeze the reference backbone flat
     // on Y=0 and partition off-reference nodes into independent bubble regions
     // (connected components of the non-reference subgraph). Each bubble then
@@ -267,8 +294,9 @@ int main(int argc, char** argv) {
     SgdParams p;
     p.pin_y = ref_mask.empty() ? nullptr : &ref_mask;
     p.pin_strength = pin_strength;
-    p.region = hierarchical ? &region : nullptr;
-    p.freeze = hierarchical ? &freeze_mask : nullptr;
+    if (compartments > 0)      { p.region = &comp_region; p.freeze = &comp_freeze; }
+    else if (hierarchical)     { p.region = &region;      p.freeze = &freeze_mask; }
+    else                       { p.region = nullptr;      p.freeze = nullptr; }
     p.iter_max = iter_max;
     p.nthreads = threads;
     p.seed = seed;
