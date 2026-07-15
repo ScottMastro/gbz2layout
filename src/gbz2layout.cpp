@@ -298,9 +298,13 @@ int main(int argc, char** argv) {
     std::ofstream out(tsv);
     out << "idx\tX\tY\tcomponent\n";
     out.precision(9);
+    // flush denormals / negligible coordinates to 0: a node pulled onto the
+    // frozen backbone can underflow to a subnormal, which is meaningless at
+    // layout scale and trips strtod-based parsers.
+    auto fz = [](double v){ return std::fabs(v) < 1e-9 ? 0.0 : v; };
     for (std::uint64_t r = 0; r < N; ++r) {
-        out << (2 * r)     << '\t' << X[2 * r].load()     << '\t' << Y[2 * r].load()     << "\t0\n";
-        out << (2 * r + 1) << '\t' << X[2 * r + 1].load() << '\t' << Y[2 * r + 1].load() << "\t0\n";
+        out << (2 * r)     << '\t' << fz(X[2 * r].load())     << '\t' << fz(Y[2 * r].load())     << "\t0\n";
+        out << (2 * r + 1) << '\t' << fz(X[2 * r + 1].load()) << '\t' << fz(Y[2 * r + 1].load()) << "\t0\n";
     }
     out.close();
     std::cerr << "[gbz2layout] wrote " << tsv << " (" << (2 * N) << " rows)\n";

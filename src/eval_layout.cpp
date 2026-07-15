@@ -49,9 +49,12 @@ int main(int argc, char** argv) {
             std::uint64_t idx; double x, y;
             std::istringstream ss(line);
             std::string tok;
+            // tolerant parse: glibc stod throws out_of_range on subnormal
+            // (underflow) coordinates, e.g. a node pulled to Y~=0; treat as 0.
+            auto sd = [](const std::string& s){ try { return std::stod(s); } catch (const std::out_of_range&) { return 0.0; } };
             std::getline(ss, tok, '\t'); idx = std::stoull(tok);
-            std::getline(ss, tok, '\t'); x = std::stod(tok);
-            std::getline(ss, tok, '\t'); y = std::stod(tok);
+            std::getline(ss, tok, '\t'); x = sd(tok);
+            std::getline(ss, tok, '\t'); y = sd(tok);
             if (idx < 2 * N) { tx[idx] = x; ty[idx] = y; th[idx] = 1; }
         }
         for (std::uint64_t r = 0; r < N; ++r) {
