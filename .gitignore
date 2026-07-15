@@ -1,0 +1,16 @@
+# build artifacts
+/build/
+/local/
+
+# redundant dep source copies — the headers actually compiled live in
+# src/third_party/ (committed). deps/vendor/ is just the upstream clones.
+/deps/vendor/
+
+# editor / OS
+*.o
+*.a
+*.so
+*.png
+*.lay.tsv
+*.links.tsv
+.DS_Store
