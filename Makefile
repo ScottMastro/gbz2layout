@@ -30,6 +30,12 @@ $(BUILD)/eval_layout: $(SRC)/eval_layout.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp | $(BUI
 
 eval: $(BUILD)/eval_layout
 
+# crossing-count (legibility) metric — pure geometry, no GBZ needed
+$(BUILD)/eval_crossings: $(SRC)/eval_crossings.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(SRC)/eval_crossings.cpp -o $@
+
+crossings: $(BUILD)/eval_crossings
+
 # original probe (kept)
 $(BUILD)/xp_probe: $(SRC)/xp_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(SRC)/xp_probe.cpp $(LDFLAGS) $(LIBS) -o $@
