@@ -1,4 +1,5 @@
 #include "sgd_minibatch.hpp"
+#include "sgd_minibatch_gpu.hpp"
 
 #include "third_party/XoshiroCpp.hpp"
 #include "third_party/dirty_zipfian_int_distribution.h"
@@ -90,7 +91,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
     // path is seen once per epoch. updates/group = mult * group_steps, so an
     // epoch does mult * total_full_steps updates at that epoch's eta — matching
     // a non-batched run's per-iteration budget, at one-group peak memory.
-    std::vector<std::uint32_t> seqs = xp.path_seq_ids();
+    std::vector<std::uint32_t> seqs = p.paths ? *p.paths : xp.path_seq_ids();
     if (seqs.empty()) { std::cerr << "[minibatch] no paths\n"; return; }
     std::vector<std::uint32_t> order(seqs.size());
     std::iota(order.begin(), order.end(), 0);
@@ -101,7 +102,49 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
     if (p.progress)
         std::cerr << "[minibatch] " << seqs.size() << " paths, K=" << K
                   << " -> " << groups_per_pass << " groups/epoch, "
-                  << iter_max << " epochs (full pass each)\n";
+                  << iter_max << " epochs (full pass each)"
+                  << (p.use_gpu ? " [GPU]" : "") << "\n";
+
+    // ---- GPU path: same epoch/group loop, update kernel on device ----
+    if (p.use_gpu) {
+        const std::uint64_t N = xp.node_count();
+        std::vector<std::uint32_t> seqlen(N);
+        for (std::uint64_t r = 0; r < N; ++r) seqlen[r] = (std::uint32_t)xp.node_length_of_rank(r);
+        std::vector<double> Xd(2 * N), Yd(2 * N);
+        for (std::uint64_t k = 0; k < 2 * N; ++k) { Xd[k] = X[k].load(); Yd[k] = Y[k].load(); }
+
+        GpuLayout gpu;
+        gpu.init(N, p.seed, p.nthreads, seqlen.data(), zetas, space, space_max, space_quantization_step, p.theta);
+        gpu.set_coords(Xd.data(), Yd.data());
+
+        for (std::uint64_t iter = 0; iter < iter_max; ++iter) {
+            std::shuffle(order.begin(), order.end(), shuf);
+            const double eta = etas[iter];
+            const bool cooling = (iter >= first_cooling_iteration);
+            std::uint64_t epoch_updates = 0;
+            for (std::uint64_t gstart = 0; gstart < order.size(); gstart += K) {
+                std::uint64_t gend = std::min(order.size(), gstart + K);
+                std::vector<std::uint32_t> group;
+                for (std::uint64_t c = gstart; c < gend; ++c) group.push_back(seqs[order[c]]);
+                PathBatch b = build_batch(gbwt_index, xp, group.data(), group.size());
+                if (b.total < 2) continue;
+                std::uint64_t updates = p.updates_mult * b.total;
+                epoch_updates += updates;
+                gpu.run_group(b.rank.data(), b.pos.data(), b.rev.data(), b.start.data(),
+                              (std::uint32_t)(b.start.size() - 1), b.total, eta, cooling,
+                              updates, p.window_len);
+            }
+            if (p.progress)
+                std::cerr << "[minibatch] epoch " << iter << "/" << iter_max
+                          << " eta=" << eta << " updates=" << epoch_updates
+                          << (cooling ? " (cooling)" : "") << " [GPU]\n";
+        }
+        gpu.get_coords(Xd.data(), Yd.data());
+        for (std::uint64_t k = 0; k < 2 * N; ++k) { X[k].store(Xd[k]); Y[k].store(Yd[k]); }
+        gpu.destroy();
+        if (p.progress) std::cerr << "[minibatch] done (" << iter_max << " full-pass epochs, GPU)\n";
+        return;
+    }
 
     for (std::uint64_t iter = 0; iter < iter_max; ++iter) {
         std::shuffle(order.begin(), order.end(), shuf);     // fresh pass each epoch
@@ -136,24 +179,29 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
                 if (plen < 2) continue;
                 std::uint64_t iA = sA - s0;
 
+                // sub-path window: cap how far B can be from A along the path
+                const std::uint64_t W = p.window_len ? std::min(space, p.window_len) : space;
                 std::uint64_t sB;
                 if (cooling || flip(gen)) {
                     std::uint64_t jump, z_i;
                     if ((iA > 0 && flip(gen)) || iA == plen - 1) {
-                        jump = std::min(space, iA);
+                        jump = std::min(W, iA);
                         std::uint64_t sl = jump > space_max ? space_max + (jump - space_max) / space_quantization_step + 1 : jump;
                         dirtyzipf::dirty_zipfian_int_distribution<std::uint64_t>::param_type zp(1, jump, p.theta, zetas[sl]);
                         dirtyzipf::dirty_zipfian_int_distribution<std::uint64_t> z(zp); z_i = z(gen);
                         sB = s0 + (iA - z_i);
                     } else {
-                        jump = std::min(space, plen - iA - 1);
+                        jump = std::min(W, plen - iA - 1);
                         std::uint64_t sl = jump > space_max ? space_max + (jump - space_max) / space_quantization_step + 1 : jump;
                         dirtyzipf::dirty_zipfian_int_distribution<std::uint64_t>::param_type zp(1, jump, p.theta, zetas[sl]);
                         dirtyzipf::dirty_zipfian_int_distribution<std::uint64_t> z(zp); z_i = z(gen);
                         sB = s0 + (iA + z_i);
                     }
                 } else {
-                    std::uniform_int_distribution<std::uint64_t> r(0, plen - 1);
+                    // uniform B, but within +/- W of A when windowed
+                    std::uint64_t lo = (p.window_len && iA > W) ? iA - W : 0;
+                    std::uint64_t hi = p.window_len ? std::min(plen - 1, iA + W) : plen - 1;
+                    std::uniform_int_distribution<std::uint64_t> r(lo, hi);
                     sB = s0 + r(gen);
                 }
                 if (sB == sA) continue;

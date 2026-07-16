@@ -9,16 +9,33 @@ LIBS    := -Wl,-Bstatic -lgbwtgraph -lgbwt -lhandlegraph -lsdsl -ldivsufsort -ld
            -Wl,-Bdynamic -fopenmp -pthread
 LDFLAGS := -L$(LIBDIR)
 
+# CUDA (optional GPU backend for the minibatch). RTX 4050 = sm_89.
+NVCC     := nvcc
+NVCCFLAGS:= -std=c++17 -O3 -arch=sm_89 -Isrc
+CUDALIBS := -lcudart -lcuda
+
 BUILD   := build
 SRC     := src
 
-.PHONY: all clean probe tool test
+.PHONY: all clean probe tool tool-nocuda test
 
 all: $(BUILD)/gbz2layout $(BUILD)/xp_probe
 
+# GPU backend (nvcc-compiled object; isolated from the templated headers)
+$(BUILD)/sgd_minibatch_gpu.o: $(SRC)/sgd_minibatch_gpu.cu $(SRC)/sgd_minibatch_gpu.hpp $(SRC)/third_party/dirty_zipfian_int_distribution.h | $(BUILD)
+	$(NVCC) $(NVCCFLAGS) -c $(SRC)/sgd_minibatch_gpu.cu -o $@
+
 # main tool
-$(BUILD)/gbz2layout: $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_layout.hpp $(SRC)/sgd_minibatch.cpp $(SRC)/sgd_minibatch.hpp $(SRC)/compartment.cpp $(SRC)/compartment.hpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_minibatch.cpp $(SRC)/compartment.cpp $(LDFLAGS) $(LIBS) -o $@
+$(BUILD)/gbz2layout: $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_layout.hpp $(SRC)/sgd_minibatch.cpp $(SRC)/sgd_minibatch.hpp $(SRC)/sgd_minibatch_gpu.hpp $(BUILD)/sgd_minibatch_gpu.o $(SRC)/compartment.cpp $(SRC)/compartment.hpp $(SRC)/export_gbz.cpp $(SRC)/export_gbz.hpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_minibatch.cpp $(SRC)/compartment.cpp $(SRC)/export_gbz.cpp $(BUILD)/sgd_minibatch_gpu.o $(LDFLAGS) $(LIBS) $(CUDALIBS) -o $@
+
+# CUDA-free build for hosts without a GPU (e.g. cluster compute nodes). Links a
+# stub GpuLayout (available()==false) instead of the nvcc object, so no CUDA
+# runtime is required. --gpu is unavailable in this build; everything else
+# (layout on CPU, --export-gbz, --export-all-gbz) works identically.
+tool-nocuda: $(BUILD)/gbz2layout-nocuda
+$(BUILD)/gbz2layout-nocuda: $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_layout.hpp $(SRC)/sgd_minibatch.cpp $(SRC)/sgd_minibatch.hpp $(SRC)/sgd_minibatch_gpu.hpp $(SRC)/sgd_minibatch_gpu_stub.cpp $(SRC)/compartment.cpp $(SRC)/compartment.hpp $(SRC)/export_gbz.cpp $(SRC)/export_gbz.hpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_minibatch.cpp $(SRC)/compartment.cpp $(SRC)/export_gbz.cpp $(SRC)/sgd_minibatch_gpu_stub.cpp $(LDFLAGS) $(LIBS) -o $@
 
 # xp self-test
 $(BUILD)/test_xp: $(SRC)/test_xp.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp | $(BUILD)

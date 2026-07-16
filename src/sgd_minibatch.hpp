@@ -36,6 +36,14 @@ struct MinibatchParams {
     std::uint64_t nthreads = 1;
     bool          progress = true;
     std::uint64_t seed = 9399220;
+    // sub-path sampling: if >0, the paired sample is drawn within this many
+    // steps of the anchor along its path (overlapping length-L windows). Keeps
+    // local adjacency, drops long-range pairs. 0 = whole-path (unbounded).
+    std::uint64_t window_len = 0;
+    bool          use_gpu = false;           // run the update on the GPU (odgi-derived kernel)
+    // diagnostic: if set, use ONLY these paths as the universe (no full coverage)
+    // instead of xp.path_seq_ids(). Nodes off these paths keep their init pos.
+    const std::vector<std::uint32_t>* paths = nullptr;
 };
 
 // X, Y sized 2*node_count (two endpoints/node), indexed 2*rank + endpoint.

@@ -22,9 +22,20 @@ for c in $CHROMS; do
     echo "$(date) OK   $c already complete ($remote bytes)" >> "$LOG"; continue
   fi
   echo "$(date) GET  $c ($(awk "BEGIN{printf \"%.1f\", $remote/1073741824}") GB) local=$local" >> "$LOG"
-  curl -sS -C - --retry 5 --retry-delay 10 -o "$dst" "$url" >> "$LOG" 2>&1
+  # Resume until complete: a dropped connection leaves a partial, so re-issue
+  # curl -C - (byte-range resume) until the local size matches remote, capping
+  # attempts so a genuinely-gone remote can't spin forever.
+  attempt=0
   final=$(stat -c%s "$dst" 2>/dev/null || echo 0)
+  while [ "$final" != "$remote" ] && [ "$attempt" -lt 20 ]; do
+    attempt=$((attempt+1))
+    curl -sS -C - --retry 5 --retry-delay 10 -o "$dst" "$url" >> "$LOG" 2>&1
+    final=$(stat -c%s "$dst" 2>/dev/null || echo 0)
+    [ "$final" = "$remote" ] && break
+    echo "$(date) RESUME $c attempt=$attempt ($final/$remote)" >> "$LOG"
+    sleep 5
+  done
   if [ "$final" = "$remote" ]; then echo "$(date) DONE $c" >> "$LOG"
-  else echo "$(date) INCOMPLETE $c ($final/$remote)" >> "$LOG"; fi
+  else echo "$(date) INCOMPLETE $c ($final/$remote) after $attempt attempts" >> "$LOG"; fi
 done
 echo "=== mirror finished $(date) ===" >> "$LOG"

@@ -11,6 +11,7 @@
 #include "sgd_layout.hpp"
 #include "sgd_minibatch.hpp"
 #include "compartment.hpp"
+#include "export_gbz.hpp"
 
 #include <gbwtgraph/gbz.h>
 
@@ -25,6 +26,8 @@
 #include <iostream>
 #include <queue>
 #include <random>
+#include <set>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -44,7 +47,51 @@ static void usage() {
     "  --pinch-window W   local-envelope half-window for pinch detection [50]\n"
     "  --path-batch K     whole-path minibatch SGD: K paths/iteration, no per-node cap (low peak RAM)\n"
     "  --updates-mult M   minibatch updates/iteration = M * batch steps [10]\n"
+    "  --path-subset K    DIAGNOSTIC: lay out from only K random whole paths (drops rare nodes; emits .covered.tsv)\n"
+    "  --export-gbz FILE  with --chromosome: write a standalone per-chromosome GBZ to FILE and exit (no layout)\n"
+    "  --export-all-gbz DIR  write DIR/<contig>.v2.gbz for every reference contig (one load) and exit\n"
     "  --seed N           RNG seed [9399220]\n";
+}
+
+// BFS a chromosome's connected component from its reference path; fills `mask`
+// (indexed by node_id - genome_min_id) with the component's nodes. Returns the
+// number of nodes marked, or 0 if no reference path matches `chromosome`.
+// (MC chromosomes are disjoint components, so the BFS stays within one.)
+static std::uint64_t compute_chromosome_mask(const gbwtgraph::GBWTGraph& graph,
+                                             const std::string& chromosome,
+                                             std::int64_t genome_min_id,
+                                             std::vector<bool>& mask) {
+    std::int64_t gmax = graph.max_node_id();
+    std::uint64_t span = std::uint64_t(gmax - genome_min_id + 1);
+    mask.assign(span, false);
+    bool found = false;
+    std::queue<std::uint64_t> bfs;
+    graph.for_each_path_handle([&](const handlegraph::path_handle_t& path) {
+        if (found) return;
+        std::string nm = graph.get_path_name(path);
+        std::string contig = nm.substr(nm.find_last_of('#') + 1);
+        auto br = contig.find('[');            // strip GBWTGraph fragment suffix contig[offset]
+        if (br != std::string::npos) contig = contig.substr(0, br);
+        if (contig != chromosome) return;
+        found = true;
+        graph.for_each_step_in_path(path, [&](const handlegraph::step_handle_t& s) {
+            std::uint64_t id = graph.get_id(graph.get_handle_of_step(s));
+            if (!mask[id - genome_min_id]) { mask[id - genome_min_id] = true; bfs.push(id); }
+        });
+    });
+    if (!found) return 0;
+    std::uint64_t marked = bfs.size();
+    while (!bfs.empty()) {
+        std::uint64_t id = bfs.front(); bfs.pop();
+        handle_t h = graph.get_handle(id, false);
+        for (bool go_left : {false, true})
+            graph.follow_edges(h, go_left, [&](const handle_t& nb) {
+                std::uint64_t nid = graph.get_id(nb);
+                if (!mask[nid - genome_min_id]) { mask[nid - genome_min_id] = true; bfs.push(nid); ++marked; }
+                return true;
+            });
+    }
+    return marked;
 }
 
 int main(int argc, char** argv) {
@@ -67,6 +114,11 @@ int main(int argc, char** argv) {
     std::uint64_t pinch_window = 50;  // local-envelope half-window (reference nodes)
     std::uint64_t path_batch = 0;     // >0: whole-path minibatch SGD, K paths/iteration
     std::uint64_t updates_mult = 10;  // minibatch updates/iter = mult * batch steps
+    std::uint64_t path_subset = 0;    // DIAGNOSTIC: lay out from only K random whole paths (drops rare nodes)
+    std::uint64_t window_len = 0;     // sub-path sampling: pair within L steps of anchor (0 = whole path)
+    bool gpu = false;                 // run the minibatch update on the GPU
+    std::string export_gbz;           // if set (+ --chromosome): write a standalone per-chr GBZ and exit
+    std::string export_all;           // if set: write a per-chr GBZ for every reference contig into this dir and exit
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -88,9 +140,14 @@ int main(int argc, char** argv) {
         else if (a == "--pinch-window") pinch_window = std::stoull(next());
         else if (a == "--path-batch") path_batch = std::stoull(next());
         else if (a == "--updates-mult") updates_mult = std::stoull(next());
+        else if (a == "--path-subset") path_subset = std::stoull(next());
+        else if (a == "--window-len") window_len = std::stoull(next());
+        else if (a == "--gpu") gpu = true;
+        else if (a == "--export-gbz") export_gbz = next();
+        else if (a == "--export-all-gbz") export_all = next();
         else { std::cerr << "unknown arg: " << a << "\n"; usage(); return 1; }
     }
-    if (out_prefix.empty()) { std::cerr << "error: -o required\n"; return 1; }
+    if (out_prefix.empty() && export_gbz.empty() && export_all.empty()) { std::cerr << "error: -o required\n"; return 1; }
 
     // load GBZ
     std::cerr << "[gbz2layout] loading " << gbz_path << "\n";
@@ -100,42 +157,52 @@ int main(int argc, char** argv) {
       gbz.simple_sds_load(in); }
     const gbwtgraph::GBWTGraph& graph = gbz.graph;
 
+    std::int64_t genome_min_id = graph.min_node_id();
+
+    // ---- batch: write a per-chromosome GBZ for every reference contig, then exit.
+    // Load the whole-genome GBZ once and stream each chromosome out (vs reloading
+    // 5 GB per chromosome). Largest components go last, so an OOM on chr1 only
+    // costs chr1 — everything else is already written (skip-if-exists = resumable).
+    if (!export_all.empty()) {
+        std::vector<std::string> contigs; std::set<std::string> seen;
+        graph.for_each_path_handle([&](const handlegraph::path_handle_t& p) {
+            std::string nm = graph.get_path_name(p);
+            std::string c = nm.substr(nm.find_last_of('#') + 1);
+            auto br = c.find('[');             // fragmented reference paths: contig[offset]
+            if (br != std::string::npos) c = c.substr(0, br);
+            if (seen.insert(c).second) contigs.push_back(c);
+        });
+        std::cerr << "[export-all] " << contigs.size() << " reference contigs; sizing components\n";
+        struct ChrMask { std::string name; std::vector<bool> mask; std::uint64_t marked; };
+        std::vector<ChrMask> chrs;
+        for (const std::string& c : contigs) {
+            std::vector<bool> m;
+            std::uint64_t marked = compute_chromosome_mask(graph, c, genome_min_id, m);
+            if (marked == 0) { std::cerr << "[export-all] " << c << ": no ref path, skip\n"; continue; }
+            chrs.push_back({c, std::move(m), marked});
+        }
+        std::sort(chrs.begin(), chrs.end(),
+                  [](const ChrMask& a, const ChrMask& b){ return a.marked < b.marked; });
+        std::uint64_t ok_count = 0;
+        for (const ChrMask& cm : chrs) {
+            std::string out = export_all + "/" + cm.name + ".v2.gbz";
+            { std::ifstream probe(out, std::ios::binary);
+              if (probe.good()) { std::cerr << "[export-all] " << cm.name << ": exists, skip\n"; ++ok_count; continue; } }
+            std::cerr << "[export-all] " << cm.name << ": " << cm.marked << " nodes\n";
+            XP cxp;
+            cxp.build(gbz, 1, false, &cm.mask, genome_min_id);
+            if (export_chromosome_gbz(gbz, cxp, cm.mask, genome_min_id, cm.name, out, true)) ++ok_count;
+        }
+        std::cerr << "[export-all] done: " << ok_count << "/" << chrs.size() << " written\n";
+        return 0;
+    }
+
     // optional: extract a single chromosome from a whole-genome GBZ by BFS'ing
     // its connected component (MC chromosomes are disjoint components).
     std::vector<bool> mask;
-    std::int64_t genome_min_id = graph.min_node_id();
     if (!chromosome.empty()) {
-        std::int64_t gmax = graph.max_node_id();
-        std::uint64_t span = std::uint64_t(gmax - genome_min_id + 1);
-        mask.assign(span, false);
-        // find the chromosome's reference path: PanSN name sample#hap#<contig>,
-        // match contig (after last '#') == chromosome
-        bool found = false;
-        std::queue<std::uint64_t> bfs;      // node ids
-        graph.for_each_path_handle([&](const handlegraph::path_handle_t& path) {
-            if (found) return;
-            std::string nm = graph.get_path_name(path);
-            std::string contig = nm.substr(nm.find_last_of('#') + 1);
-            if (contig != chromosome) return;
-            found = true;
-            graph.for_each_step_in_path(path, [&](const handlegraph::step_handle_t& s) {
-                std::uint64_t id = graph.get_id(graph.get_handle_of_step(s));
-                if (!mask[id - genome_min_id]) { mask[id - genome_min_id] = true; bfs.push(id); }
-            });
-        });
-        if (!found) { std::cerr << "error: no reference path for contig '" << chromosome << "'\n"; return 1; }
-        // BFS the component to capture off-reference (bubble) nodes too
-        std::uint64_t marked = bfs.size();
-        while (!bfs.empty()) {
-            std::uint64_t id = bfs.front(); bfs.pop();
-            handle_t h = graph.get_handle(id, false);
-            for (bool go_left : {false, true})
-                graph.follow_edges(h, go_left, [&](const handle_t& nb) {
-                    std::uint64_t nid = graph.get_id(nb);
-                    if (!mask[nid - genome_min_id]) { mask[nid - genome_min_id] = true; bfs.push(nid); ++marked; }
-                    return true;
-                });
-        }
+        std::uint64_t marked = compute_chromosome_mask(graph, chromosome, genome_min_id, mask);
+        if (marked == 0) { std::cerr << "error: no reference path for contig '" << chromosome << "'\n"; return 1; }
         std::cerr << "[gbz2layout] chromosome " << chromosome << ": " << marked
                   << " nodes in component\n";
     }
@@ -144,9 +211,21 @@ int main(int argc, char** argv) {
     // mode we only need node metadata + the path list, not the full step index,
     // so build a cap-1 (tiny) XP and stream whole paths per iteration instead.
     XP xp;
-    std::uint64_t xp_cap = (path_batch > 0) ? 1 : cap;
+    std::uint64_t xp_cap = (path_batch > 0 || path_subset > 0 || !export_gbz.empty()) ? 1 : cap;
     xp.build(gbz, xp_cap, true, chromosome.empty() ? nullptr : &mask, genome_min_id);
     const std::uint64_t N = xp.node_count();
+
+    // ---- optional: write a standalone single-chromosome GBZ and exit ----
+    // (extracts this chromosome's nodes+threads into a compact GBZ so downstream
+    // layout / pangyplot ingest loads at chromosome scale, not whole-genome.)
+    if (!export_gbz.empty()) {
+        if (chromosome.empty()) {
+            std::cerr << "error: --export-gbz requires --chromosome\n"; return 1;
+        }
+        bool ok = export_chromosome_gbz(gbz, xp, mask, genome_min_id,
+                                        chromosome, export_gbz, true);
+        return ok ? 0 : 1;
+    }
 
     // ---- initialization ----
     std::vector<std::atomic<double>> X(2 * N), Y(2 * N);
@@ -328,13 +407,15 @@ int main(int argc, char** argv) {
               << " min_term_updates=" << p.min_term_updates
               << " (total " << (p.iter_max * p.min_term_updates) << ")\n";
 
+    std::vector<std::uint32_t> subset;   // diagnostic: fixed whole-path universe
+    std::vector<char> covered;           // nodes reachable from the subset
     auto t0 = std::chrono::steady_clock::now();
-    if (path_batch > 0) {
+    if (path_batch > 0 || path_subset > 0) {
         // whole-path minibatch: stream K paths/iteration from the GBWT
         std::uint64_t full_max = xp.max_full_path_step_count();
         MinibatchParams mp;
         mp.iter_max = iter_max;
-        mp.batch_paths = path_batch;
+        mp.batch_paths = path_batch > 0 ? path_batch : 64;
         mp.updates_mult = updates_mult;
         mp.nthreads = threads;
         mp.seed = seed;
@@ -343,6 +424,28 @@ int main(int argc, char** argv) {
         mp.space_quantization_step = 100;
         mp.eta_max = (double)full_max * (double)full_max;
         mp.theta = 0.99; mp.eps = 0.01; mp.cooling_start = 0.5;
+        mp.window_len = window_len;
+        mp.use_gpu = gpu;
+
+        if (path_subset > 0) {
+            // DIAGNOSTIC: use only K random whole paths (drops rare nodes).
+            subset = xp.path_seq_ids();
+            std::mt19937_64 rr(seed);
+            std::shuffle(subset.begin(), subset.end(), rr);
+            if (subset.size() > path_subset) subset.resize(path_subset);
+            covered.assign(N, 0);
+            for (std::uint32_t sq : subset) {
+                gbwt::vector_type pth = gbz.index.extract(sq);
+                for (gbwt::node_type nd : pth) covered[xp.rank_of_id(gbwt::Node::id(nd))] = 1;
+            }
+            std::uint64_t ncov = 0; for (char c : covered) ncov += c;
+            std::cerr << "[gbz2layout] path-subset diagnostic: " << subset.size()
+                      << " whole paths, " << ncov << "/" << N << " nodes covered ("
+                      << (100.0 * ncov / (double)N) << "%)\n";
+            mp.paths = &subset;
+            mp.batch_paths = std::min<std::uint64_t>(mp.batch_paths, subset.size());
+        }
+
         std::cerr << "[gbz2layout] minibatch: iter=" << mp.iter_max << " K=" << mp.batch_paths
                   << " updates_mult=" << mp.updates_mult << " threads=" << mp.nthreads
                   << " full_max_steps=" << full_max << "\n";
@@ -409,6 +512,16 @@ int main(int argc, char** argv) {
         mo.close();
         std::uint64_t nref = 0; for (char c : is_ref) nref += c;
         std::cerr << "[gbz2layout] wrote " << mp << " (" << nref << " reference nodes)\n";
+    }
+
+    // ---- diagnostic: emit which nodes the path-subset covered ----
+    if (path_subset > 0 && !covered.empty()) {
+        std::string cp = out_prefix + ".covered.tsv";
+        std::ofstream co(cp);
+        co << "rank\tcovered\n";
+        for (std::uint64_t r = 0; r < N; ++r) co << r << '\t' << (int)covered[r] << '\n';
+        co.close();
+        std::cerr << "[gbz2layout] wrote " << cp << "\n";
     }
     return 0;
 }
