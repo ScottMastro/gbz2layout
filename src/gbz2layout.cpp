@@ -9,6 +9,7 @@
 
 #include "xp.hpp"
 #include "sgd_layout.hpp"
+#include "sgd_minibatch.hpp"
 #include "compartment.hpp"
 
 #include <gbwtgraph/gbz.h>
@@ -41,6 +42,8 @@ static void usage() {
     "  --hierarchical     freeze backbone, lay out each bubble independently (prototype)\n"
     "  --compartments N   balanced pinch-bounded compartments, N target tasks (parallel-ready)\n"
     "  --pinch-window W   local-envelope half-window for pinch detection [50]\n"
+    "  --path-batch K     whole-path minibatch SGD: K paths/iteration, no per-node cap (low peak RAM)\n"
+    "  --updates-mult M   minibatch updates/iteration = M * batch steps [10]\n"
     "  --seed N           RNG seed [9399220]\n";
 }
 
@@ -62,6 +65,8 @@ int main(int argc, char** argv) {
     bool hierarchical = false; // divide-and-conquer: freeze backbone, lay out each bubble independently
     std::uint64_t compartments = 0;   // >0: balanced pinch-bounded compartments (target task count)
     std::uint64_t pinch_window = 50;  // local-envelope half-window (reference nodes)
+    std::uint64_t path_batch = 0;     // >0: whole-path minibatch SGD, K paths/iteration
+    std::uint64_t updates_mult = 10;  // minibatch updates/iter = mult * batch steps
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -81,6 +86,8 @@ int main(int argc, char** argv) {
         else if (a == "--hierarchical") hierarchical = true;
         else if (a == "--compartments") compartments = std::stoull(next());
         else if (a == "--pinch-window") pinch_window = std::stoull(next());
+        else if (a == "--path-batch") path_batch = std::stoull(next());
+        else if (a == "--updates-mult") updates_mult = std::stoull(next());
         else { std::cerr << "unknown arg: " << a << "\n"; usage(); return 1; }
     }
     if (out_prefix.empty()) { std::cerr << "error: -o required\n"; return 1; }
@@ -133,9 +140,12 @@ int main(int argc, char** argv) {
                   << " nodes in component\n";
     }
 
-    // build XP (filtered to the chromosome if a mask was computed)
+    // build XP (filtered to the chromosome if a mask was computed). In minibatch
+    // mode we only need node metadata + the path list, not the full step index,
+    // so build a cap-1 (tiny) XP and stream whole paths per iteration instead.
     XP xp;
-    xp.build(gbz, cap, true, chromosome.empty() ? nullptr : &mask, genome_min_id);
+    std::uint64_t xp_cap = (path_batch > 0) ? 1 : cap;
+    xp.build(gbz, xp_cap, true, chromosome.empty() ? nullptr : &mask, genome_min_id);
     const std::uint64_t N = xp.node_count();
 
     // ---- initialization ----
@@ -319,7 +329,27 @@ int main(int argc, char** argv) {
               << " (total " << (p.iter_max * p.min_term_updates) << ")\n";
 
     auto t0 = std::chrono::steady_clock::now();
-    path_linear_sgd_layout(graph, xp, p, X, Y);
+    if (path_batch > 0) {
+        // whole-path minibatch: stream K paths/iteration from the GBWT
+        std::uint64_t full_max = xp.max_full_path_step_count();
+        MinibatchParams mp;
+        mp.iter_max = iter_max;
+        mp.batch_paths = path_batch;
+        mp.updates_mult = updates_mult;
+        mp.nthreads = threads;
+        mp.seed = seed;
+        mp.space = full_max;
+        mp.space_max = std::min<std::uint64_t>(mp.space, 1000);
+        mp.space_quantization_step = 100;
+        mp.eta_max = (double)full_max * (double)full_max;
+        mp.theta = 0.99; mp.eps = 0.01; mp.cooling_start = 0.5;
+        std::cerr << "[gbz2layout] minibatch: iter=" << mp.iter_max << " K=" << mp.batch_paths
+                  << " updates_mult=" << mp.updates_mult << " threads=" << mp.nthreads
+                  << " full_max_steps=" << full_max << "\n";
+        path_linear_sgd_layout_minibatch(graph, gbz.index, xp, mp, X, Y);
+    } else {
+        path_linear_sgd_layout(graph, xp, p, X, Y);
+    }
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::cerr << "[gbz2layout] SGD done in " << secs << " s\n";
 

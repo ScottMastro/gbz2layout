@@ -106,6 +106,7 @@ void XP::build(const gbwtgraph::GBZ& gbz, std::uint64_t cap, bool verbose,
         max_steps_path = std::max(max_steps_path, path_steps_full[p]);
         max_bp_path = std::max(max_bp_path, path_bp[p]);
     }
+    max_full_path_steps_ = max_steps_path;
     const std::uint8_t w_hand = wbits(((node_count_ ? node_count_ - 1 : 0) << 1) | 1);
     const std::uint8_t w_pos  = wbits(max_bp_path);
     const std::uint8_t w_npi  = wbits(n_paths ? n_paths - 1 : 0);

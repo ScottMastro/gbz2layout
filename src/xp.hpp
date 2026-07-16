@@ -53,6 +53,8 @@ public:
     std::uint64_t path_count() const { return path_start_.size() - 1; }
     std::uint64_t node_count() const { return node_count_; }
     std::uint64_t max_path_step_count() const { return max_path_steps_; }
+    // full (uncapped) longest-path step count — the Zipf space for minibatch
+    std::uint64_t max_full_path_step_count() const { return max_full_path_steps_; }
 
     // node-grouped arrays for uniform step sampling
     const sdsl::bit_vector&   get_np_bv()  const { return np_bv_; }
@@ -81,6 +83,10 @@ public:
     // for each reference step: (node_rank, bp_position). ref_len_bp filled.
     const std::vector<std::uint32_t>& ref_ranks() const { return ref_ranks_; }
     const std::vector<std::uint64_t>& ref_positions() const { return ref_positions_; }
+
+    // gbwt forward-sequence id for every chromosome path (independent of cap) —
+    // used by the minibatch layout to stream whole-path groups from the GBWT.
+    const std::vector<std::uint32_t>& path_seq_ids() const { return path_seq_id_; }
 
     std::uint64_t total_steps() const { return total_steps_; }
 
@@ -112,6 +118,7 @@ private:
 
     std::uint64_t total_steps_ = 0;
     std::uint64_t max_path_steps_ = 0;
+    std::uint64_t max_full_path_steps_ = 0;
     const gbwt::Metadata* meta_ = nullptr;
 };
 
