@@ -2,6 +2,10 @@
 /build/
 /local/
 
+# local run data: GBZ inputs, layout outputs, benchmark logs
+/data/
+/out/
+
 # redundant dep source copies — the headers actually compiled live in
 # src/third_party/ (committed). deps/vendor/ is just the upstream clones.
 /deps/vendor/
