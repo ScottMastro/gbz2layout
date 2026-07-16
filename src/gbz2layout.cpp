@@ -12,6 +12,7 @@
 #include "sgd_minibatch.hpp"
 #include "export_gbz.hpp"
 #include "odgi_lay.hpp"
+#include "components.hpp"
 
 #include <gbwtgraph/gbz.h>
 
@@ -455,6 +456,22 @@ int main(int argc, char** argv) {
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::cerr << "[gbz2layout] SGD done in " << secs << " s\n";
 
+    // ---- weak components: label + pack (odgi layout_main.cpp:400-432) ----
+    // Without this a multi-component graph lays every component on top of the
+    // others at the origin and reports them all as component 0. odgi measures
+    // each component's bbox and stacks them vertically with a border. Our
+    // per-chromosome GBZs are single-component by construction, so this is a
+    // no-op for them -- but the tool has to be right for an arbitrary GBZ.
+    std::vector<std::int32_t> component;
+    std::uint64_t ncomp = weakly_connected_components(graph, xp, component);
+    if (ncomp > 1) {
+        pack_components(ncomp, component, X, Y);
+        std::cerr << "[gbz2layout] " << ncomp
+                  << " weak components; packed into a vertical stack (border 1000)\n";
+    } else {
+        std::cerr << "[gbz2layout] 1 weak component\n";
+    }
+
     // ---- emit .lay.tsv (odgi-compatible) ----
     std::string tsv = out_prefix + ".lay.tsv";
     std::ofstream out(tsv);
@@ -471,8 +488,9 @@ int main(int argc, char** argv) {
     // at layout scale and trips strtod-based parsers.
     auto fz = [](double v){ return std::fabs(v) < 1e-9 ? 0.0 : v; };
     for (std::uint64_t r = 0; r < N; ++r) {
-        out << (2 * r)     << '\t' << fz(X[2 * r].load())     << '\t' << fz(Y[2 * r].load())     << "\t0\n";
-        out << (2 * r + 1) << '\t' << fz(X[2 * r + 1].load()) << '\t' << fz(Y[2 * r + 1].load()) << "\t0\n";
+        const std::int32_t c = component[r];
+        out << (2 * r)     << '\t' << fz(X[2 * r].load())     << '\t' << fz(Y[2 * r].load())     << '\t' << c << '\n';
+        out << (2 * r + 1) << '\t' << fz(X[2 * r + 1].load()) << '\t' << fz(Y[2 * r + 1].load()) << '\t' << c << '\n';
     }
     out.close();
     std::cerr << "[gbz2layout] wrote " << tsv << " (" << (2 * N) << " rows)\n";
