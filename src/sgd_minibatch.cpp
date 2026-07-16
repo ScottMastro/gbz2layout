@@ -57,24 +57,44 @@ struct PathBatch {
 //
 // Cost: the raw paths must all be resident to compute offsets (~8 B/step on top
 // of the batch's ~13 B/step). Each is freed as soon as it's converted.
-static PathBatch build_batch(const gbwt::GBWT& idx, const XP& xp,
-                             const std::uint32_t* seqs, std::uint64_t n,
-                             std::uint64_t nthreads) {
-    PathBatch b;
+//
+// `b` is reused across groups by the caller, and the flat arrays only ever GROW.
+// That matters more than it looks: vector::resize() VALUE-initializes, so sizing
+// them per group memset ~13 B/step to zero -- on the main thread, serially --
+// immediately before the fill loop overwrote every one of those bytes. A gdb
+// capture caught the main thread exactly there:
+//
+//   #0 __memset_avx2_unaligned_erms
+//   #1 std::vector<unsigned long>::_M_default_append   <- b.pos.resize()
+//   #2 gbz2layout::build_batch
+//
+// Constructing a fresh PathBatch per group also malloc/free'd that buffer every
+// time; large blocks come from mmap, so the kernel zeroed the pages on fault and
+// then memset zeroed them again. For chr15-sized groups (~83M steps at K=128)
+// that is ~1.1 GB of pointless zeroing per group, ~480 times per run.
+//
+// Growing only means the cost is paid once, for the largest group seen. Reading
+// [0, total) is safe when the arrays are longer -- the per-path ranges tile
+// [0, total) exactly, so every element read was written by this call.
+static void build_batch(const gbwt::GBWT& idx, const XP& xp,
+                        const std::uint32_t* seqs, std::uint64_t n,
+                        std::uint64_t nthreads, PathBatch& b) {
     std::vector<gbwt::vector_type> paths(n);
 
     #pragma omp parallel for schedule(dynamic) num_threads(nthreads)
     for (std::int64_t k = 0; k < (std::int64_t)n; ++k)
         paths[k] = idx.extract(seqs[k]);
 
-    b.start.resize(n + 1);
+    b.start.resize(n + 1);                       // shrink or same size: no zeroing
     b.start[0] = 0;
     for (std::uint64_t k = 0; k < n; ++k) b.start[k + 1] = b.start[k] + paths[k].size();
     b.total = b.start[n];
 
-    b.rank.resize(b.total);
-    b.pos.resize(b.total);
-    b.rev.resize(b.total);
+    if (b.rank.size() < b.total) {               // grow only; no-op once warmed up
+        b.rank.resize(b.total);
+        b.pos.resize(b.total);
+        b.rev.resize(b.total);
+    }
 
     #pragma omp parallel for schedule(dynamic) num_threads(nthreads)
     for (std::int64_t k = 0; k < (std::int64_t)n; ++k) {
@@ -89,7 +109,6 @@ static PathBatch build_batch(const gbwt::GBWT& idx, const XP& xp,
         }
         gbwt::vector_type().swap(paths[k]);      // release as we go
     }
-    return b;
 }
 
 void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
@@ -149,6 +168,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
         gpu.init(N, p.seed, p.nthreads, seqlen.data(), zetas, space, space_max, space_quantization_step, p.theta);
         gpu.set_coords(Xd.data(), Yd.data());
 
+        PathBatch b;   // hoisted: reused across groups so its arrays grow once
         for (std::uint64_t iter = 0; iter < iter_max; ++iter) {
             std::shuffle(order.begin(), order.end(), shuf);
             const double eta = etas[iter];
@@ -158,7 +178,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
                 std::uint64_t gend = std::min(order.size(), gstart + K);
                 std::vector<std::uint32_t> group;
                 for (std::uint64_t c = gstart; c < gend; ++c) group.push_back(seqs[order[c]]);
-                PathBatch b = build_batch(gbwt_index, xp, group.data(), group.size(), nthreads);
+                build_batch(gbwt_index, xp, group.data(), group.size(), nthreads, b);
                 if (b.total < 2) continue;
                 std::uint64_t updates = p.updates_mult * b.total;
                 epoch_updates += updates;
@@ -178,6 +198,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
         return;
     }
 
+    PathBatch b;   // hoisted: reused across groups so its arrays grow once
     for (std::uint64_t iter = 0; iter < iter_max; ++iter) {
         std::shuffle(order.begin(), order.end(), shuf);     // fresh pass each epoch
         const double eta = etas[iter];
@@ -190,7 +211,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
         std::vector<std::uint32_t> group;
         group.reserve(gend - gstart);
         for (std::uint64_t c = gstart; c < gend; ++c) group.push_back(seqs[order[c]]);
-        PathBatch b = build_batch(gbwt_index, xp, group.data(), group.size(), nthreads);
+        build_batch(gbwt_index, xp, group.data(), group.size(), nthreads, b);
         if (b.total < 2) continue;
 
         const std::uint64_t updates = p.updates_mult * b.total;
