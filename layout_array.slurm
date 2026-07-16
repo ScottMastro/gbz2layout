@@ -6,8 +6,22 @@
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=16
 #SBATCH --array=0-24               # one task per chromosome (see CHROMS); add %N to throttle
+#SBATCH --constraint=avx512        # see GLIBC note below -- do not drop this
 # #SBATCH --partition=<fill in>
 # #SBATCH --account=<fill in>
+
+# GLIBC: the nodes are NOT homogeneous. A binary linked on a login node (glibc
+# >= 2.34) fails to load on the older nodes:
+#   /lib64/libc.so.6: version `GLIBC_2.34' not found
+# It's a load-time failure, so the task dies in 0.02s having done nothing --
+# most tasks succeed and a few die instantly, which reads like a flake but isn't.
+# --constraint=avx512 pins to the newer hardware, whose glibc matches the login
+# node's. (Same family as the -march=native SIGILL: heterogeneous cluster, binary
+# built once. That one was the ISA; this one is the C library.)
+#
+# The alternative, if the constraint ever excludes too many nodes, is to build on
+# a compute node instead of the login node -- `salloc --constraint=avx512` and run
+# fix_build.sh there -- so the binary links against the same glibc it runs on.
 
 # Per-chromosome PG-SGD layout, one array task each, reading the per-chr GBZs the
 # export array already wrote to hprc-v2-gbz/. Wall-clock is the slowest single
