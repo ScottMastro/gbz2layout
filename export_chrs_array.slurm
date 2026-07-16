@@ -32,8 +32,13 @@ CHR=${CHROMS[${SLURM_ARRAY_TASK_ID:?run as an array job (sbatch --array=...)}]}
 
 mkdir -p "$OUT"
 DST="$OUT/$CHR.v2.gbz"
-if [ -s "$DST" ]; then echo "$CHR already present ($DST) — skip"; exit 0; fi
+# End early if this chromosome is already done. The write below is atomic
+# (temp + rename), so DST only ever exists when the export finished — a task
+# killed mid-write leaves only a .partial file and never a false "done".
+if [ -s "$DST" ]; then echo "$CHR already present ($DST) — nothing to do, exiting"; exit 0; fi
 
 echo "host=$(hostname)  chr=$CHR  start=$(date -Iseconds)"
-/usr/bin/time -v "$BIN" "$GBZ" --chromosome "$CHR" --export-gbz "$DST"
+TMP="$DST.partial.${SLURM_ARRAY_JOB_ID:-$$}"
+/usr/bin/time -v "$BIN" "$GBZ" --chromosome "$CHR" --export-gbz "$TMP"
+mv -f "$TMP" "$DST"
 echo "chr=$CHR  done=$(date -Iseconds)  size=$(stat -c%s "$DST") bytes"
