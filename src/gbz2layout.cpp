@@ -3,14 +3,15 @@
 //   load GBZ -> build GBWT-backed lean XP (optional per-node cap)
 //   -> reference-anchored init -> PG-SGD (odgi port) -> emit .lay.tsv
 //
-// Output idx column matches odgi: 2 rows per node (2*rank, 2*rank+1) in
-// GBWTGraph for_each_handle order. The GFA fed to `pangyplot add` must share
-// that node order (integration contract, validated at M3).
+// Output matches odgi's layout format: 2 rows per node (2*rank, 2*rank+1) in
+// GBWTGraph for_each_handle order, as .lay.tsv and/or odgi's binary .lay. Any
+// consumer must share that node order -- that is the integration contract.
 
 #include "xp.hpp"
 #include "sgd_layout.hpp"
 #include "sgd_minibatch.hpp"
 #include "export_gbz.hpp"
+#include "odgi_lay.hpp"
 
 #include <gbwtgraph/gbz.h>
 
@@ -18,11 +19,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <thread>
 #include <iostream>
+#include <limits>
 #include <queue>
 #include <random>
 #include <set>
@@ -35,6 +38,9 @@ using namespace gbz2layout;
 static void usage() {
     std::cerr <<
     "usage: gbz2layout <graph.gbz> -o <out_prefix> [options]\n"
+    "       gbz2layout tsv2lay <in.lay.tsv> <out.lay>   convert a layout TSV to odgi's binary .lay\n"
+    "       gbz2layout lay2tsv <in.lay> <out.lay.tsv>   convert odgi's binary .lay to a layout TSV\n"
+    "\n"
     "  -o PREFIX          output prefix (writes PREFIX.lay.tsv)\n"
     "  --chromosome NAME  restrict to NAME's connected component (BFS from its reference path)\n"
     "  --threads N        worker threads [hw]\n"
@@ -57,6 +63,8 @@ static void usage() {
     " extra outputs / export\n"
     "  --emit-links       also write PREFIX.links.tsv\n"
     "  --emit-meta        also write PREFIX.meta.tsv (reference nodes)\n"
+    "  --emit-lay         also write PREFIX.lay -- odgi's binary layout format, readable\n"
+    "                     by `odgi draw`. ~2.4x smaller than the TSV, which is still written.\n"
     "  --export-gbz FILE  with --chromosome: write a standalone per-chromosome GBZ to FILE and exit (no layout)\n"
     "  --export-all-gbz DIR  write DIR/<contig>.v2.gbz for every reference contig (one load) and exit\n";
 }
@@ -102,8 +110,116 @@ static std::uint64_t compute_chromosome_mask(const gbwtgraph::GBWTGraph& graph,
     return marked;
 }
 
+// ---- subcommand: tsv2lay ----------------------------------------------------
+// Convert an existing .lay.tsv to odgi's binary .lay without recomputing the
+// layout. Useful for TSVs already produced elsewhere (e.g. by the cluster array,
+// or before --emit-lay existed): chr1's TSV is 665 MB and converting is seconds
+// versus a two-hour re-run.
+//
+// Rows are indexed by their idx column rather than by file order: odgi's own
+// to_tsv() emits per weak-component, so the rows are not guaranteed sequential.
+static int tsv2lay_main(int argc, char** argv) {
+    if (argc < 4) {
+        std::cerr << "usage: gbz2layout tsv2lay <in.lay.tsv> <out.lay>\n"
+                     "  Converts an odgi-format layout TSV to odgi's binary .lay.\n"
+                     "  Reads the idx/X/Y columns; any component column is ignored.\n";
+        return 1;
+    }
+    const std::string in_path = argv[2], out_path = argv[3];
+
+    std::ifstream in(in_path);
+    if (!in) { std::cerr << "cannot open " << in_path << "\n"; return 1; }
+
+    std::string line;
+    if (!std::getline(in, line)) { std::cerr << "empty file: " << in_path << "\n"; return 1; }
+    if (line.rfind("idx", 0) != 0)
+        std::cerr << "[tsv2lay] warning: no 'idx' header; treating line 1 as data\n";
+
+    std::vector<double> X, Y;
+    std::uint64_t rows = 0;
+    auto put = [&](std::uint64_t idx, double x, double y) {
+        if (idx >= X.size()) { X.resize(idx + 1, 0.0); Y.resize(idx + 1, 0.0); }
+        X[idx] = x; Y[idx] = y; ++rows;
+    };
+    auto parse = [&](const std::string& s) {
+        // idx \t X \t Y [\t component] -- strtod/strtoull, not streams (21M rows)
+        const char* p = s.c_str();
+        char* e = nullptr;
+        std::uint64_t idx = std::strtoull(p, &e, 10);   if (e == p) return false;
+        double x = std::strtod(e, &e);
+        double y = std::strtod(e, &e);
+        put(idx, x, y);
+        return true;
+    };
+    if (line.rfind("idx", 0) != 0) parse(line);
+    while (std::getline(in, line)) { if (!line.empty()) parse(line); }
+    in.close();
+
+    if (X.empty()) { std::cerr << "no rows parsed from " << in_path << "\n"; return 1; }
+    if (rows != X.size())
+        std::cerr << "[tsv2lay] warning: " << rows << " rows but max idx implies "
+                  << X.size() << " -- gaps are zero-filled\n";
+    std::cerr << "[tsv2lay] read " << rows << " rows (" << (X.size() / 2) << " nodes)\n";
+
+    OdgiLayout lay(X, Y);
+    std::ofstream out(out_path, std::ios::binary);
+    if (!out) { std::cerr << "cannot write " << out_path << "\n"; return 1; }
+    lay.serialize(out);
+    out.close();
+
+    std::ifstream a(in_path, std::ios::binary | std::ios::ate);
+    std::ifstream b(out_path, std::ios::binary | std::ios::ate);
+    double ta = (double)a.tellg(), tb = (double)b.tellg();
+    std::cerr << "[tsv2lay] wrote " << out_path << " ("
+              << (std::uint64_t)(tb / (1024 * 1024)) << " MB, "
+              << (tb > 0 ? ta / tb : 0.0) << "x smaller than the TSV)\n";
+    return 0;
+}
+
+// ---- subcommand: lay2tsv ----------------------------------------------------
+// The inverse of tsv2lay: read odgi's binary .lay and write the layout TSV.
+// Makes .lay usable as a transport/archive format -- move the small binary
+// around, expand to TSV where a text layout is wanted -- and it reads .lay files
+// odgi itself produced, not just ours.
+//
+// Precision matches the direct emitter (odgi's digits10+1), so a .lay -> TSV ->
+// .lay round-trip is stable.
+static int lay2tsv_main(int argc, char** argv) {
+    if (argc < 4) {
+        std::cerr << "usage: gbz2layout lay2tsv <in.lay> <out.lay.tsv>\n"
+                     "  Expands odgi's binary layout to an odgi-format layout TSV.\n";
+        return 1;
+    }
+    const std::string in_path = argv[2], out_path = argv[3];
+
+    std::ifstream in(in_path, std::ios::binary);
+    if (!in) { std::cerr << "cannot open " << in_path << "\n"; return 1; }
+    OdgiLayout lay;
+    lay.load(in);
+    in.close();
+
+    const std::uint64_t entries = lay.size();      // node ends (2 per node)
+    if (entries == 0) { std::cerr << "no entries in " << in_path << "\n"; return 1; }
+    if (entries % 2) std::cerr << "[lay2tsv] warning: odd entry count " << entries
+                               << " -- not 2 ends per node?\n";
+
+    std::ofstream out(out_path);
+    if (!out) { std::cerr << "cannot write " << out_path << "\n"; return 1; }
+    out << "idx\tX\tY\tcomponent\n";
+    out.precision(std::numeric_limits<double>::digits10 + 1);
+    for (std::uint64_t i = 0; i < entries; ++i)
+        out << i << '\t' << lay.get_x(i) << '\t' << lay.get_y(i) << "\t0\n";
+    out.close();
+
+    std::cerr << "[lay2tsv] wrote " << out_path << " (" << entries << " rows, "
+              << (entries / 2) << " nodes)\n";
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 1; }
+    if (std::string(argv[1]) == "tsv2lay") return tsv2lay_main(argc, argv);
+    if (std::string(argv[1]) == "lay2tsv") return lay2tsv_main(argc, argv);
     std::string gbz_path = argv[1];
     std::string out_prefix;
     std::uint64_t cap = 30;
@@ -115,6 +231,7 @@ int main(int argc, char** argv) {
     std::string chromosome;   // if set, extract this chromosome from a whole-genome GBZ
     bool emit_links = false;   // also write PREFIX.links.tsv (edges) for rendering
     bool emit_meta = false;    // also write PREFIX.meta.tsv (rank, is_ref) for analysis
+    bool emit_lay = false;     // also write PREFIX.lay (odgi binary layout)
     std::uint64_t path_batch = 0;     // >0: whole-path minibatch SGD, K whole paths per group
     std::uint64_t updates_mult = 10;  // minibatch updates/group = mult * group steps
     std::uint64_t window_len = 0;     // sub-path sampling: pair within L steps of anchor (0 = whole path)
@@ -135,6 +252,7 @@ int main(int argc, char** argv) {
         else if (a == "--chromosome") chromosome = next();
         else if (a == "--emit-links") emit_links = true;
         else if (a == "--emit-meta") emit_meta = true;
+        else if (a == "--emit-lay") emit_lay = true;
         else if (a == "--path-batch") path_batch = std::stoull(next());
         else if (a == "--updates-mult") updates_mult = std::stoull(next());
         else if (a == "--window-len") window_len = std::stoull(next());
@@ -341,10 +459,16 @@ int main(int argc, char** argv) {
     std::string tsv = out_prefix + ".lay.tsv";
     std::ofstream out(tsv);
     out << "idx\tX\tY\tcomponent\n";
-    out.precision(9);
-    // flush denormals / negligible coordinates to 0: a node pulled onto the
-    // frozen backbone can underflow to a subnormal, which is meaningless at
-    // layout scale and trips strtod-based parsers.
+    // Match odgi exactly: layout.cpp does
+    //   out << std::setprecision(std::numeric_limits<double>::digits10 + 1);
+    // i.e. 16 significant digits. We previously wrote 9, which is plenty for a
+    // layout (~0.2 bp at chr1's coordinate range) but meant the TSV could not
+    // round-trip a double: tsv2lay could only recover what the TSV carried, so a
+    // .lay built from a TSV differed from one emitted directly. Same precision
+    // everywhere is worth the ~30-40% bigger TSV.
+    out.precision(std::numeric_limits<double>::digits10 + 1);
+    // flush denormals / negligible coordinates to 0: a subnormal is meaningless
+    // at layout scale and trips strtod-based parsers.
     auto fz = [](double v){ return std::fabs(v) < 1e-9 ? 0.0 : v; };
     for (std::uint64_t r = 0; r < N; ++r) {
         out << (2 * r)     << '\t' << fz(X[2 * r].load())     << '\t' << fz(Y[2 * r].load())     << "\t0\n";
@@ -352,6 +476,24 @@ int main(int argc, char** argv) {
     }
     out.close();
     std::cerr << "[gbz2layout] wrote " << tsv << " (" << (2 * N) << " rows)\n";
+
+    // ---- optional: emit odgi's binary .lay alongside the TSV ----
+    // Same coordinates, odgi's own format (see odgi_lay.hpp), so `odgi draw` and
+    // any other odgi-format reader can consume it. ~2.4x smaller than the TSV,
+    // which matters at chr1 scale (a 985 MB TSV vs a ~405 MB .lay) and when
+    // moving a whole genome between machines. Additive: the TSV is still written.
+    if (emit_lay) {
+        std::string lp = out_prefix + ".lay";
+        std::vector<double> Xd(2 * N), Yd(2 * N);
+        for (std::uint64_t k = 0; k < 2 * N; ++k) { Xd[k] = fz(X[k].load()); Yd[k] = fz(Y[k].load()); }
+        OdgiLayout lay(Xd, Yd);
+        std::ofstream lo(lp, std::ios::binary);
+        lay.serialize(lo);
+        lo.close();
+        std::ifstream sz(lp, std::ios::binary | std::ios::ate);
+        std::cerr << "[gbz2layout] wrote " << lp << " (odgi binary, "
+                  << (sz.tellg() / (1024 * 1024)) << " MB)\n";
+    }
 
     // ---- optional: emit links (edges) for rendering connectivity ----
     // node-rank pairs a<b (deduped). Lets the renderer draw actual edges so

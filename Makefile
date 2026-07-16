@@ -35,16 +35,16 @@ $(BUILD)/sgd_minibatch_gpu.o: $(SRC)/sgd_minibatch_gpu.cu $(SRC)/sgd_minibatch_g
 	$(NVCC) $(NVCCFLAGS) -c $(SRC)/sgd_minibatch_gpu.cu -o $@
 
 # main tool
-$(BUILD)/gbz2layout: $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_layout.hpp $(SRC)/sgd_minibatch.cpp $(SRC)/sgd_minibatch.hpp $(SRC)/sgd_minibatch_gpu.hpp $(BUILD)/sgd_minibatch_gpu.o $(SRC)/export_gbz.cpp $(SRC)/export_gbz.hpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_minibatch.cpp $(SRC)/export_gbz.cpp $(BUILD)/sgd_minibatch_gpu.o $(LDFLAGS) $(LIBS) $(CUDALIBS) -o $@
+$(BUILD)/gbz2layout: $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_layout.hpp $(SRC)/sgd_minibatch.cpp $(SRC)/sgd_minibatch.hpp $(SRC)/sgd_minibatch_gpu.hpp $(BUILD)/sgd_minibatch_gpu.o $(SRC)/export_gbz.cpp $(SRC)/export_gbz.hpp $(SRC)/odgi_lay.cpp $(SRC)/odgi_lay.hpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_minibatch.cpp $(SRC)/export_gbz.cpp $(SRC)/odgi_lay.cpp $(BUILD)/sgd_minibatch_gpu.o $(LDFLAGS) $(LIBS) $(CUDALIBS) -o $@
 
 # CUDA-free build for hosts without a GPU (e.g. cluster compute nodes). Links a
 # stub GpuLayout (available()==false) instead of the nvcc object, so no CUDA
 # runtime is required. --gpu is unavailable in this build; everything else
 # (layout on CPU, --export-gbz, --export-all-gbz) works identically.
 tool-nocuda: $(BUILD)/gbz2layout-nocuda
-$(BUILD)/gbz2layout-nocuda: $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_layout.hpp $(SRC)/sgd_minibatch.cpp $(SRC)/sgd_minibatch.hpp $(SRC)/sgd_minibatch_gpu.hpp $(SRC)/sgd_minibatch_gpu_stub.cpp $(SRC)/export_gbz.cpp $(SRC)/export_gbz.hpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_minibatch.cpp $(SRC)/export_gbz.cpp $(SRC)/sgd_minibatch_gpu_stub.cpp $(LDFLAGS) $(LIBS) -o $@
+$(BUILD)/gbz2layout-nocuda: $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_layout.hpp $(SRC)/sgd_minibatch.cpp $(SRC)/sgd_minibatch.hpp $(SRC)/sgd_minibatch_gpu.hpp $(SRC)/sgd_minibatch_gpu_stub.cpp $(SRC)/export_gbz.cpp $(SRC)/export_gbz.hpp $(SRC)/odgi_lay.cpp $(SRC)/odgi_lay.hpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(SRC)/gbz2layout.cpp $(SRC)/xp.cpp $(SRC)/sgd_layout.cpp $(SRC)/sgd_minibatch.cpp $(SRC)/export_gbz.cpp $(SRC)/odgi_lay.cpp $(SRC)/sgd_minibatch_gpu_stub.cpp $(LDFLAGS) $(LIBS) -o $@
 
 # xp self-test
 $(BUILD)/test_xp: $(SRC)/test_xp.cpp $(SRC)/xp.cpp $(SRC)/xp.hpp | $(BUILD)
