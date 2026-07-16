@@ -10,7 +10,6 @@
 #include "xp.hpp"
 #include "sgd_layout.hpp"
 #include "sgd_minibatch.hpp"
-#include "compartment.hpp"
 #include "export_gbz.hpp"
 
 #include <gbwtgraph/gbz.h>
@@ -55,17 +54,9 @@ static void usage() {
     "  --gpu              run the minibatch update on the GPU; requires --path-batch and a CUDA\n"
     "                     build (`make tool`). `make tool-nocuda` aborts on this flag.\n"
     "\n"
-    " reference handling\n"
-    "  --pin-reference    hold reference-path nodes toward their initial positions\n"
-    "  --pin-strength S   as --pin-reference, with restoring strength S\n"
-    "  --hierarchical     freeze backbone, lay out each bubble independently (prototype)\n"
-    "  --compartments N   balanced pinch-bounded compartments, N target tasks (parallel-ready)\n"
-    "  --pinch-window W   local-envelope half-window for pinch detection [50]\n"
-    "\n"
     " extra outputs / export\n"
     "  --emit-links       also write PREFIX.links.tsv\n"
     "  --emit-meta        also write PREFIX.meta.tsv (reference nodes)\n"
-    "  --path-subset K    DIAGNOSTIC: lay out from only K random whole paths (drops rare nodes; emits .covered.tsv)\n"
     "  --export-gbz FILE  with --chromosome: write a standalone per-chromosome GBZ to FILE and exit (no layout)\n"
     "  --export-all-gbz DIR  write DIR/<contig>.v2.gbz for every reference contig (one load) and exit\n";
 }
@@ -122,16 +113,10 @@ int main(int argc, char** argv) {
     std::string init_mode = "ref";
     std::uint64_t seed = 9399220;
     std::string chromosome;   // if set, extract this chromosome from a whole-genome GBZ
-    bool pin_reference = false;
-    double pin_strength = 1.0; // 1 = hard pin, 0 = free, between = soft spring
     bool emit_links = false;   // also write PREFIX.links.tsv (edges) for rendering
     bool emit_meta = false;    // also write PREFIX.meta.tsv (rank, is_ref) for analysis
-    bool hierarchical = false; // divide-and-conquer: freeze backbone, lay out each bubble independently
-    std::uint64_t compartments = 0;   // >0: balanced pinch-bounded compartments (target task count)
-    std::uint64_t pinch_window = 50;  // local-envelope half-window (reference nodes)
-    std::uint64_t path_batch = 0;     // >0: whole-path minibatch SGD, K paths/iteration
-    std::uint64_t updates_mult = 10;  // minibatch updates/iter = mult * batch steps
-    std::uint64_t path_subset = 0;    // DIAGNOSTIC: lay out from only K random whole paths (drops rare nodes)
+    std::uint64_t path_batch = 0;     // >0: whole-path minibatch SGD, K whole paths per group
+    std::uint64_t updates_mult = 10;  // minibatch updates/group = mult * group steps
     std::uint64_t window_len = 0;     // sub-path sampling: pair within L steps of anchor (0 = whole path)
     bool gpu = false;                 // run the minibatch update on the GPU
     std::string export_gbz;           // if set (+ --chromosome): write a standalone per-chr GBZ and exit
@@ -148,16 +133,10 @@ int main(int argc, char** argv) {
         else if (a == "--init") init_mode = next();
         else if (a == "--seed") seed = std::stoull(next());
         else if (a == "--chromosome") chromosome = next();
-        else if (a == "--pin-reference") pin_reference = true;
-        else if (a == "--pin-strength") { pin_reference = true; pin_strength = std::stod(next()); }
         else if (a == "--emit-links") emit_links = true;
         else if (a == "--emit-meta") emit_meta = true;
-        else if (a == "--hierarchical") hierarchical = true;
-        else if (a == "--compartments") compartments = std::stoull(next());
-        else if (a == "--pinch-window") pinch_window = std::stoull(next());
         else if (a == "--path-batch") path_batch = std::stoull(next());
         else if (a == "--updates-mult") updates_mult = std::stoull(next());
-        else if (a == "--path-subset") path_subset = std::stoull(next());
         else if (a == "--window-len") window_len = std::stoull(next());
         else if (a == "--gpu") gpu = true;
         else if (a == "--export-gbz") export_gbz = next();
@@ -228,7 +207,7 @@ int main(int argc, char** argv) {
     // mode we only need node metadata + the path list, not the full step index,
     // so build a cap-1 (tiny) XP and stream whole paths per iteration instead.
     XP xp;
-    std::uint64_t xp_cap = (path_batch > 0 || path_subset > 0 || !export_gbz.empty()) ? 1 : cap;
+    std::uint64_t xp_cap = (path_batch > 0 || !export_gbz.empty()) ? 1 : cap;
     xp.build(gbz, xp_cap, true, chromosome.empty() ? nullptr : &mask, genome_min_id);
     const std::uint64_t N = xp.node_count();
 
@@ -309,102 +288,8 @@ int main(int argc, char** argv) {
         for (std::uint64_t k = 0; k < 2 * N; ++k) X[k].store(uni(rng));
     }
 
-    // ---- optional: pin reference nodes to the line Y=0 (free in X) ----
-    std::vector<bool> ref_mask;
-    if (pin_reference) {
-        if (!xp.has_reference()) {
-            std::cerr << "[gbz2layout] --pin-reference: no reference path; ignoring\n";
-        } else {
-            ref_mask.assign(N, false);
-            for (std::uint32_t r : xp.ref_ranks()) {
-                ref_mask[r] = true;
-                Y[2 * r].store(0.0);        // lock both endpoints onto Y=0
-                Y[2 * r + 1].store(0.0);
-            }
-            std::uint64_t pinned = 0;
-            for (bool b : ref_mask) pinned += b;
-            std::cerr << "[gbz2layout] pin-reference: " << pinned
-                      << " reference nodes locked to Y=0 (free in X)\n";
-        }
-    }
-
-    // ---- compartment mode: balanced pinch-bounded chunks laid out jointly ----
-    // Each compartment = a backbone stretch + its bubbles (full SGD inside, so
-    // it de-collides); only the chosen boundary pinches are frozen anchors.
-    std::vector<bool>         comp_freeze;
-    std::vector<std::int32_t> comp_region;
-    if (compartments > 0) {
-        if (!xp.has_reference()) {
-            std::cerr << "[gbz2layout] --compartments: no reference path; ignoring\n";
-            compartments = 0;
-        } else {
-            CompartmentResult cr = build_compartments(
-                gbz, graph, xp, compartments, pinch_window, genome_min_id,
-                chromosome.empty() ? nullptr : &mask, true);
-            comp_region = std::move(cr.region);
-            comp_freeze = std::move(cr.freeze);
-            for (std::uint64_t r = 0; r < N; ++r)
-                if (comp_freeze[r]) { Y[2 * r].store(0.0); Y[2 * r + 1].store(0.0); }  // anchors on Y=0
-        }
-    }
-
-    // ---- hierarchical (divide-and-conquer): freeze the reference backbone flat
-    // on Y=0 and partition off-reference nodes into independent bubble regions
-    // (connected components of the non-reference subgraph). Each bubble then
-    // settles on its own against the fixed backbone; cross-bubble forces are cut.
-    std::vector<bool>         freeze_mask;   // reference/anchor nodes (never move)
-    std::vector<std::int32_t> region;        // interior region id; -1 = anchor
-    if (hierarchical) {
-        if (!xp.has_reference()) {
-            std::cerr << "[gbz2layout] --hierarchical: no reference path; ignoring\n";
-            hierarchical = false;
-        } else {
-            freeze_mask.assign(N, false);
-            for (std::uint32_t r : xp.ref_ranks()) {
-                freeze_mask[r] = true;
-                Y[2 * r].store(0.0);        // flat skeleton on Y=0 (X already = bp)
-                Y[2 * r + 1].store(0.0);
-            }
-            // union-find over non-reference nodes: connect interior neighbours.
-            std::vector<std::uint64_t> uf(N);
-            for (std::uint64_t r = 0; r < N; ++r) uf[r] = r;
-            std::function<std::uint64_t(std::uint64_t)> find =
-                [&](std::uint64_t x){ while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; } return x; };
-            auto uni = [&](std::uint64_t a, std::uint64_t b){ uf[find(a)] = find(b); };
-            for (std::uint64_t r = 0; r < N; ++r) {
-                if (freeze_mask[r]) continue;
-                handle_t h = graph.get_handle(xp.node_id_of_rank(r), false);
-                for (bool go_left : {false, true})
-                    graph.follow_edges(h, go_left, [&](const handle_t& nb) {
-                        std::uint64_t nr = xp.rank_of_handle(nb);
-                        if (nr < N && !freeze_mask[nr]) uni(r, nr);
-                        return true;
-                    });
-            }
-            // densify component roots into region ids; anchors get -1
-            region.assign(N, -1);
-            std::vector<std::int32_t> root2id(N, -1);
-            std::int32_t next_id = 0;
-            std::uint64_t interior = 0;
-            for (std::uint64_t r = 0; r < N; ++r) {
-                if (freeze_mask[r]) continue;
-                std::uint64_t root = find(r);
-                if (root2id[root] < 0) root2id[root] = next_id++;
-                region[r] = root2id[root];
-                ++interior;
-            }
-            std::cerr << "[gbz2layout] hierarchical: " << (N - interior) << " frozen anchors, "
-                      << interior << " interior nodes in " << next_id << " bubble regions\n";
-        }
-    }
-
     // ---- SGD params (odgi defaults) ----
     SgdParams p;
-    p.pin_y = ref_mask.empty() ? nullptr : &ref_mask;
-    p.pin_strength = pin_strength;
-    if (compartments > 0)      { p.region = &comp_region; p.freeze = &comp_freeze; }
-    else if (hierarchical)     { p.region = &region;      p.freeze = &freeze_mask; }
-    else                       { p.region = nullptr;      p.freeze = nullptr; }
     p.iter_max = iter_max;
     p.nthreads = threads;
     p.seed = seed;
@@ -424,10 +309,8 @@ int main(int argc, char** argv) {
               << " min_term_updates=" << p.min_term_updates
               << " (total " << (p.iter_max * p.min_term_updates) << ")\n";
 
-    std::vector<std::uint32_t> subset;   // diagnostic: fixed whole-path universe
-    std::vector<char> covered;           // nodes reachable from the subset
     auto t0 = std::chrono::steady_clock::now();
-    if (path_batch > 0 || path_subset > 0) {
+    if (path_batch > 0) {
         // whole-path minibatch: stream K paths/iteration from the GBWT
         std::uint64_t full_max = xp.max_full_path_step_count();
         MinibatchParams mp;
@@ -443,25 +326,6 @@ int main(int argc, char** argv) {
         mp.theta = 0.99; mp.eps = 0.01; mp.cooling_start = 0.5;
         mp.window_len = window_len;
         mp.use_gpu = gpu;
-
-        if (path_subset > 0) {
-            // DIAGNOSTIC: use only K random whole paths (drops rare nodes).
-            subset = xp.path_seq_ids();
-            std::mt19937_64 rr(seed);
-            std::shuffle(subset.begin(), subset.end(), rr);
-            if (subset.size() > path_subset) subset.resize(path_subset);
-            covered.assign(N, 0);
-            for (std::uint32_t sq : subset) {
-                gbwt::vector_type pth = gbz.index.extract(sq);
-                for (gbwt::node_type nd : pth) covered[xp.rank_of_id(gbwt::Node::id(nd))] = 1;
-            }
-            std::uint64_t ncov = 0; for (char c : covered) ncov += c;
-            std::cerr << "[gbz2layout] path-subset diagnostic: " << subset.size()
-                      << " whole paths, " << ncov << "/" << N << " nodes covered ("
-                      << (100.0 * ncov / (double)N) << "%)\n";
-            mp.paths = &subset;
-            mp.batch_paths = std::min<std::uint64_t>(mp.batch_paths, subset.size());
-        }
 
         std::cerr << "[gbz2layout] minibatch: iter=" << mp.iter_max << " K=" << mp.batch_paths
                   << " updates_mult=" << mp.updates_mult << " threads=" << mp.nthreads
@@ -531,14 +395,5 @@ int main(int argc, char** argv) {
         std::cerr << "[gbz2layout] wrote " << mp << " (" << nref << " reference nodes)\n";
     }
 
-    // ---- diagnostic: emit which nodes the path-subset covered ----
-    if (path_subset > 0 && !covered.empty()) {
-        std::string cp = out_prefix + ".covered.tsv";
-        std::ofstream co(cp);
-        co << "rank\tcovered\n";
-        for (std::uint64_t r = 0; r < N; ++r) co << r << '\t' << (int)covered[r] << '\n';
-        co.close();
-        std::cerr << "[gbz2layout] wrote " << cp << "\n";
-    }
     return 0;
 }

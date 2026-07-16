@@ -123,7 +123,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
     // path is seen once per epoch. updates/group = mult * group_steps, so an
     // epoch does mult * total_full_steps updates at that epoch's eta — matching
     // a non-batched run's per-iteration budget, at one-group peak memory.
-    std::vector<std::uint32_t> seqs = p.paths ? *p.paths : xp.path_seq_ids();
+    std::vector<std::uint32_t> seqs = xp.path_seq_ids();
     if (seqs.empty()) { std::cerr << "[minibatch] no paths\n"; return; }
     std::vector<std::uint32_t> order(seqs.size());
     std::iota(order.begin(), order.end(), 0);
