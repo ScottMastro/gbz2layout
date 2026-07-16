@@ -1,7 +1,16 @@
 # gbz2layout — build the tool + probe against the vendored prefix.
 PREFIX  := $(CURDIR)/local
 CXX     := g++
-CXXFLAGS:= -std=c++17 -O3 -fopenmp -pthread -march=native -Wall -I$(PREFIX)/include
+# Target ISA. Defaults to -march=native (fastest on the build host), but that
+# emits instructions the build CPU has and others may not: building on a login
+# node and running on older compute nodes dies with SIGILL at startup. On a
+# heterogeneous cluster override with a portable baseline, e.g.
+#   make tool-nocuda ARCH="-march=x86-64-v2"     (gcc 11+; sse4.2+popcnt)
+#   make tool-nocuda ARCH="-msse4.2"             (older gcc)
+# NB: sdsl-lite hardcodes -march=native in its CMakeLists too, so it must be
+# rebuilt with the same baseline or it will SIGILL regardless of this flag.
+ARCH    ?= -march=native
+CXXFLAGS:= -std=c++17 -O3 -fopenmp -pthread $(ARCH) -Wall -I$(PREFIX)/include
 # Link libhandlegraph statically (prefix ships both .a and .so) so we don't need
 # LD_LIBRARY_PATH at runtime. Order matters for static linking.
 LIBDIR  := $(PREFIX)/lib
