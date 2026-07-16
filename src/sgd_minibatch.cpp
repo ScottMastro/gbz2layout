@@ -40,23 +40,55 @@ struct PathBatch {
     std::uint64_t total = 0;
 };
 
+// Build the group in parallel: paths are independent, and this loop was the
+// bottleneck -- measured at ~68% of GPU-mode wall-clock on ONE core while the
+// GPU sat at 0% waiting for it (chr22: 90-101% process CPU on a 12-core host).
+//
+// Two passes, because a path's offset isn't known until every earlier length
+// is: extract all paths in parallel, prefix-sum the lengths (serial, trivial),
+// then fill the flat arrays by index. No locks -- each k owns a disjoint span.
+//
+// Thread-safety rests on three things, all checked:
+//   - gbwt::GBWT::extract() is const and read-only. (CachedGBWT would NOT be
+//     safe here: it keeps a mutable internal cache. Keep this a plain GBWT.)
+//   - xp.rank_of_id / node_length_of_rank are const array lookups, no state.
+//   - b.rev is vector<uint8_t>, NOT vector<bool> -- a bit-packed vector<bool>
+//     would race on shared bytes between adjacent indices and corrupt silently.
+//
+// Cost: the raw paths must all be resident to compute offsets (~8 B/step on top
+// of the batch's ~13 B/step). Each is freed as soon as it's converted.
 static PathBatch build_batch(const gbwt::GBWT& idx, const XP& xp,
-                             const std::uint32_t* seqs, std::uint64_t n) {
+                             const std::uint32_t* seqs, std::uint64_t n,
+                             std::uint64_t nthreads) {
     PathBatch b;
-    b.start.push_back(0);
-    for (std::uint64_t k = 0; k < n; ++k) {
-        gbwt::vector_type path = idx.extract(seqs[k]);
-        std::uint64_t bp = 0;
-        for (gbwt::node_type node : path) {
-            std::uint64_t r = xp.rank_of_id(gbwt::Node::id(node));
-            b.rank.push_back((std::uint32_t)r);
-            b.pos.push_back(bp);
-            b.rev.push_back(gbwt::Node::is_reverse(node) ? 1 : 0);
+    std::vector<gbwt::vector_type> paths(n);
+
+    #pragma omp parallel for schedule(dynamic) num_threads(nthreads)
+    for (std::int64_t k = 0; k < (std::int64_t)n; ++k)
+        paths[k] = idx.extract(seqs[k]);
+
+    b.start.resize(n + 1);
+    b.start[0] = 0;
+    for (std::uint64_t k = 0; k < n; ++k) b.start[k + 1] = b.start[k] + paths[k].size();
+    b.total = b.start[n];
+
+    b.rank.resize(b.total);
+    b.pos.resize(b.total);
+    b.rev.resize(b.total);
+
+    #pragma omp parallel for schedule(dynamic) num_threads(nthreads)
+    for (std::int64_t k = 0; k < (std::int64_t)n; ++k) {
+        std::uint64_t o = b.start[k], bp = 0;
+        const gbwt::vector_type& path = paths[k];
+        for (std::uint64_t i = 0; i < path.size(); ++i) {
+            std::uint64_t r = xp.rank_of_id(gbwt::Node::id(path[i]));
+            b.rank[o + i] = (std::uint32_t)r;
+            b.pos[o + i]  = bp;
+            b.rev[o + i]  = gbwt::Node::is_reverse(path[i]) ? 1 : 0;
             bp += xp.node_length_of_rank(r);
         }
-        b.start.push_back(b.rank.size());
+        gbwt::vector_type().swap(paths[k]);      // release as we go
     }
-    b.total = b.rank.size();
     return b;
 }
 
@@ -126,7 +158,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
                 std::uint64_t gend = std::min(order.size(), gstart + K);
                 std::vector<std::uint32_t> group;
                 for (std::uint64_t c = gstart; c < gend; ++c) group.push_back(seqs[order[c]]);
-                PathBatch b = build_batch(gbwt_index, xp, group.data(), group.size());
+                PathBatch b = build_batch(gbwt_index, xp, group.data(), group.size(), nthreads);
                 if (b.total < 2) continue;
                 std::uint64_t updates = p.updates_mult * b.total;
                 epoch_updates += updates;
@@ -158,7 +190,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
         std::vector<std::uint32_t> group;
         group.reserve(gend - gstart);
         for (std::uint64_t c = gstart; c < gend; ++c) group.push_back(seqs[order[c]]);
-        PathBatch b = build_batch(gbwt_index, xp, group.data(), group.size());
+        PathBatch b = build_batch(gbwt_index, xp, group.data(), group.size(), nthreads);
         if (b.total < 2) continue;
 
         const std::uint64_t updates = p.updates_mult * b.total;
