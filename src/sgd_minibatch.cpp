@@ -184,7 +184,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
                 epoch_updates += updates;
                 gpu.run_group(b.rank.data(), b.pos.data(), b.rev.data(), b.start.data(),
                               (std::uint32_t)(b.start.size() - 1), b.total, eta, cooling,
-                              updates, p.window_len);
+                              updates);
             }
             if (p.progress)
                 std::cerr << "[minibatch] epoch " << iter << "/" << iter_max
@@ -232,8 +232,7 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
                 if (plen < 2) continue;
                 std::uint64_t iA = sA - s0;
 
-                // sub-path window: cap how far B can be from A along the path
-                const std::uint64_t W = p.window_len ? std::min(space, p.window_len) : space;
+                const std::uint64_t W = space;
                 std::uint64_t sB;
                 if (cooling || flip(gen)) {
                     std::uint64_t jump, z_i;
@@ -251,9 +250,8 @@ void path_linear_sgd_layout_minibatch(const gbwtgraph::GBWTGraph& /*graph*/,
                         sB = s0 + (iA + z_i);
                     }
                 } else {
-                    // uniform B, but within +/- W of A when windowed
-                    std::uint64_t lo = (p.window_len && iA > W) ? iA - W : 0;
-                    std::uint64_t hi = p.window_len ? std::min(plen - 1, iA + W) : plen - 1;
+                    std::uint64_t lo = 0;
+                    std::uint64_t hi = plen - 1;
                     std::uniform_int_distribution<std::uint64_t> r(lo, hi);
                     sB = s0 + r(gen);
                 }

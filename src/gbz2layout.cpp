@@ -56,8 +56,6 @@ static void usage() {
     "                     Each --iter is a full pass over every path in K-sized groups, so K bounds\n"
     "                     peak RAM without changing coverage or total updates [64]\n"
     "  --updates-mult M   minibatch updates/group = M * group steps [10]\n"
-    "  --window-len L     minibatch: draw the paired sample within L steps of the anchor\n"
-    "                     (0 = whole-path, unbounded) [0]\n"
     "  --gpu              run the minibatch update on the GPU; requires --path-batch and a CUDA\n"
     "                     build (`make tool`). `make tool-nocuda` aborts on this flag.\n"
     "\n"
@@ -235,7 +233,6 @@ int main(int argc, char** argv) {
     bool emit_lay = false;     // also write PREFIX.lay (odgi binary layout)
     std::uint64_t path_batch = 0;     // >0: whole-path minibatch SGD, K whole paths per group
     std::uint64_t updates_mult = 10;  // minibatch updates/group = mult * group steps
-    std::uint64_t window_len = 0;     // sub-path sampling: pair within L steps of anchor (0 = whole path)
     bool gpu = false;                 // run the minibatch update on the GPU
     std::string export_gbz;           // if set (+ --chromosome): write a standalone per-chr GBZ and exit
     std::string export_all;           // if set: write a per-chr GBZ for every reference contig into this dir and exit
@@ -256,7 +253,6 @@ int main(int argc, char** argv) {
         else if (a == "--emit-lay") emit_lay = true;
         else if (a == "--path-batch") path_batch = std::stoull(next());
         else if (a == "--updates-mult") updates_mult = std::stoull(next());
-        else if (a == "--window-len") window_len = std::stoull(next());
         else if (a == "--gpu") gpu = true;
         else if (a == "--export-gbz") export_gbz = next();
         else if (a == "--export-all-gbz") export_all = next();
@@ -443,7 +439,6 @@ int main(int argc, char** argv) {
         mp.space_quantization_step = 100;
         mp.eta_max = (double)full_max * (double)full_max;
         mp.theta = 0.99; mp.eps = 0.01; mp.cooling_start = 0.5;
-        mp.window_len = window_len;
         mp.use_gpu = gpu;
 
         std::cerr << "[gbz2layout] minibatch: iter=" << mp.iter_max << " K=" << mp.batch_paths

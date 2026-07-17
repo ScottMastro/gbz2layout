@@ -26,7 +26,7 @@ void GpuLayout::set_coords(const double*, const double*) { nope("set_coords"); }
 void GpuLayout::get_coords(double*, double*) const { nope("get_coords"); }
 void GpuLayout::run_group(const std::uint32_t*, const std::uint64_t*, const std::uint8_t*,
                           const std::uint64_t*, std::uint32_t, std::uint64_t,
-                          double, bool, std::uint64_t, std::uint64_t) { nope("run_group"); }
+                          double, bool, std::uint64_t) { nope("run_group"); }
 void GpuLayout::destroy() { /* nothing allocated */ }
 bool GpuLayout::available() { return false; }
 

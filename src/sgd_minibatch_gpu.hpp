@@ -27,10 +27,10 @@ struct GpuLayout {
     void get_coords(double* X, double* Y) const;                // VRAM -> host
 
     // one group of whole paths (flat arrays): run `updates` Hogwild term-updates
-    // at learning rate `eta`. window>0 bounds the paired sample to +/- window.
+    // at learning rate `eta`.
     void run_group(const std::uint32_t* rank, const std::uint64_t* pos, const std::uint8_t* rev,
                    const std::uint64_t* start, std::uint32_t npaths, std::uint64_t total,
-                   double eta, bool cooling, std::uint64_t updates, std::uint64_t window);
+                   double eta, bool cooling, std::uint64_t updates);
 
     void destroy();
     static bool available();                                    // a usable CUDA device exists

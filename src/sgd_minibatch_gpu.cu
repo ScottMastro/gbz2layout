@@ -5,8 +5,7 @@
 // Layout"), which implements the identical PG-SGD update our CPU port already
 // runs. The difference is the FEEDING: odgi holds all paths resident in VRAM;
 // here the node coordinates stay resident but each group's path_data is streamed
-// in per launch, so peak VRAM scales with K paths, not haplotype depth. A
-// window_len knob (our sub-path sampling) bounds the paired-sample distance.
+// in per launch, so peak VRAM scales with K paths, not haplotype depth.
 
 #include "sgd_minibatch_gpu.hpp"
 
@@ -95,7 +94,7 @@ __device__ void update_pos(int64_t p1, uint32_t id1, int off1,
 __global__ void group_kernel(curandStateCoalesced_t* rnd, double eta, double* zetas,
                              node_t* nodes, path_element_t* elems, path_t* paths,
                              uint64_t total_steps, double theta, uint32_t space,
-                             uint32_t space_max, uint32_t sqs, uint32_t window,
+                             uint32_t space_max, uint32_t sqs,
                              int cooling_iter, uint64_t updates, int sm_count) {
     uint64_t gid = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (gid >= updates) return;
@@ -117,9 +116,9 @@ __global__ void group_kernel(curandStateCoalesced_t* rnd, double eta, double* ze
     if (cooling[threadIdx.x / WARP_SIZE]) {
         bool backward; uint32_t js;
         if ((s1 > 0 && (curand_coalesced(rs, threadIdx.x) % 2 == 0)) || s1 == p.step_count - 1) {
-            backward = true;  js = min(min(space, s1), window ? window : space);
+            backward = true;  js = min(space, s1);
         } else {
-            backward = false; js = min(min(space, p.step_count - s1 - 1), window ? window : space);
+            backward = false; js = min(space, p.step_count - s1 - 1);
         }
         uint32_t sp = js;
         if (js > space_max) sp = space_max + (js - space_max) / sqs + 1;
@@ -127,7 +126,6 @@ __global__ void group_kernel(curandStateCoalesced_t* rnd, double eta, double* ze
         s2 = backward ? s1 - z : s1 + z;
     } else {
         uint32_t lo = 0, hi = p.step_count - 1;
-        if (window) { lo = (s1 > window) ? s1 - window : 0; hi = min(p.step_count - 1, s1 + window); }
         do { s2 = lo + curand_coalesced(rs, threadIdx.x) % (hi - lo + 1); } while (s2 == s1);
     }
     if (s2 >= p.step_count || s2 == s1) return;
@@ -203,7 +201,7 @@ void GpuLayout::get_coords(double* X, double* Y) const {
 
 void GpuLayout::run_group(const std::uint32_t* rank, const std::uint64_t* pos, const std::uint8_t* rev,
                           const std::uint64_t* start, std::uint32_t npaths, std::uint64_t total,
-                          double eta, bool cooling, std::uint64_t updates, std::uint64_t window) {
+                          double eta, bool cooling, std::uint64_t updates) {
     GpuImpl* g = (GpuImpl*)impl;
     if (total < 2 || updates == 0) return;
     if (total > g->elems_cap) { if (g->elems) cudaFree(g->elems); CUDACHECK(cudaMallocManaged(&g->elems, total * sizeof(path_element_t))); g->elems_cap = total; }
@@ -226,7 +224,7 @@ void GpuLayout::run_group(const std::uint32_t* rank, const std::uint64_t* pos, c
     uint64_t block_nbr = (updates + BLOCK_SIZE - 1) / BLOCK_SIZE;
     group_kernel<<<block_nbr, BLOCK_SIZE>>>(g->rnd, eta, g->zetas, g->nodes, g->elems, g->paths,
                                             total, g->theta, g->space, g->space_max, g->sqs,
-                                            (uint32_t)window, cooling ? 1 : 0, updates, g->sm_count);
+                                            cooling ? 1 : 0, updates, g->sm_count);
     CUDACHECK(cudaGetLastError());
     CUDACHECK(cudaDeviceSynchronize());
 }
