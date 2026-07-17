@@ -65,7 +65,7 @@ static void usage() {
     "  --emit-links       also write PREFIX.links.tsv\n"
     "  --emit-meta        also write PREFIX.meta.tsv (reference nodes)\n"
     "  --emit-lay         also write PREFIX.lay -- odgi's binary layout format, readable\n"
-    "                     by `odgi draw`. ~2.4x smaller than the TSV, which is still written.\n"
+    "                     by `odgi draw`. ~1.8x smaller than the TSV, which is still written.\n"
     "  --export-gbz FILE  with --chromosome: write a standalone per-chromosome GBZ to FILE and exit (no layout)\n"
     "  --export-all-gbz DIR  write DIR/<contig>.v2.gbz for every reference contig (one load) and exit\n";
 }
@@ -497,9 +497,13 @@ int main(int argc, char** argv) {
 
     // ---- optional: emit odgi's binary .lay alongside the TSV ----
     // Same coordinates, odgi's own format (see odgi_lay.hpp), so `odgi draw` and
-    // any other odgi-format reader can consume it. ~2.4x smaller than the TSV,
-    // which matters at chr1 scale (a 985 MB TSV vs a ~405 MB .lay) and when
-    // moving a whole genome between machines. Additive: the TSV is still written.
+    // any other odgi-format reader can consume it. ~1.8x smaller than the TSV
+    // (measured 1.64x on chrM to 1.86x on chr22; chr1 is 665 MB -> 373 MB), which
+    // matters when moving a whole genome between machines. Note the format is
+    // mildly lossy: it stores each coordinate as (v - min_value), and the
+    // subtract/re-add round-trip perturbs ~59% of values by up to ~2e-9 absolute
+    // (~1e-6 relative). That is odgi's design, not a defect here.
+    // Additive: the TSV is still written.
     if (emit_lay) {
         std::string lp = out_prefix + ".lay";
         std::vector<double> Xd(2 * N), Yd(2 * N);
